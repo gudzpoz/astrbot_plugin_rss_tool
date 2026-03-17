@@ -1,0 +1,42 @@
+{
+  "allow_agents": {
+    "description": "是否允许 AstrBot 自主修改 RSS 订阅列表",
+    "type": "bool",
+    "default": true
+  },
+  "feeds": {
+    "description": "RSS 订阅列表",
+    "hint": "若手动添加太麻烦，也可让 Agent 自动添加。",
+    "type": "template_list",
+    "templates": {
+      "site": {
+        "name": "订阅",
+        "items": {
+          "url": {
+            "description": "Atom/RSS 订阅链接",
+            "type": "string",
+            "hint": "https://example.com/rss.xml"
+          },
+          "enabled": {
+            "description": "是否启用",
+            "type": "bool",
+            "default": true
+          },
+          "title": {
+            "description": "订阅名称",
+            "type": "string"
+          },
+          "tags": {
+            "description": "订阅标签",
+            "type": "list"
+          },
+          "frequency": {
+            "description": "几小时更新一次",
+            "type": "int",
+            "default": 6
+          }
+        }
+      }
+    }
+  }
+}

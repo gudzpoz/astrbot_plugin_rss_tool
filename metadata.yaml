@@ -1,0 +1,7 @@
+name: astrbot_plugin_rss_tool
+display_name: RSS 技能
+desc: 让你的 AstrBot 可以自主获取、筛选 Atom/RSS 等 Feed 信息。
+version: v0.1.0
+astrbot_version: '>=4.14.0,<5'
+author: Kana
+repo: https://github.com/gudzpoz/astrbot_plugin_rss_tool

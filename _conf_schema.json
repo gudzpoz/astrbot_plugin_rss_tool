@@ -4,6 +4,11 @@
     "type": "bool",
     "default": true
   },
+  "user_agent": {
+    "description": "User-Agent",
+    "type": "string",
+    "default": "AstrBot RSS Tool"
+  },
   "feeds": {
     "description": "RSS 订阅列表",
     "hint": "若手动添加太麻烦，也可让 Agent 自动添加。",
@@ -30,7 +35,7 @@
             "description": "订阅标签",
             "type": "list"
           },
-          "frequency": {
+          "frequency_hours": {
             "description": "几小时更新一次",
             "type": "int",
             "default": 6

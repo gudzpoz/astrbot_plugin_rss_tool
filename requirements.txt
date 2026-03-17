@@ -1,1 +1,4 @@
-feedparser>=6.0.12
+aiosqlite>=0.21.0
+fastfeedparser>=0.5.9
+# fastfeedparser already depends lxml
+lxml

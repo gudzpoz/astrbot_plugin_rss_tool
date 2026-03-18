@@ -3,6 +3,9 @@
 提供 RSS/Atom Feed 的订阅管理、抓取、存储和查询功能。
 使用 aiosqlite 作为本地持久化存储，aiohttp 进行异步网络请求，
 fastfeedparser 解析 Feed 内容。
+
+支持 ETag / If-Modified-Since 条件请求、指数退避重试、
+301 永久重定向自动跟踪、并发抓取限制、以及添加时的 Feed URL 校验。
 """
 
 import asyncio
@@ -12,8 +15,9 @@ import time
 import typing
 from dataclasses import dataclass
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import ParseResult, parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import ParseResult, parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import aiohttp
 import aiosqlite
@@ -38,11 +42,28 @@ REQUEST_ACCEPT = (
 )
 
 # 网络请求默认超时（秒）
-REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 # query() 允许的列名白名单
 ALLOWED_QUERY_COLUMNS = frozenset(
     ["title", "link", "description", "published", "author", "content"]
+)
+
+# 并发抓取限制
+MAX_CONCURRENT_FETCHES = 8
+
+# 指数退避参数
+BACKOFF_BASE_SECONDS = 60  # 首次失败后等待 60 秒
+BACKOFF_MAX_SECONDS = 24 * 3600  # 最大退避 24 小时
+BACKOFF_MULTIPLIER = 2  # 每次失败翻倍
+
+# Feed 内容类型匹配
+FEED_CONTENT_TYPES = (
+    "application/atom+xml",
+    "application/rss+xml",
+    "application/rdf+xml",
+    "application/xml",
+    "text/xml",
 )
 
 
@@ -94,17 +115,23 @@ class RSSToolFeed:
     id: int
     last_fetch_time: int
     config_site: RSSToolConfigSite
+    etag: str = ""
+    fail_count: int = 0
+    next_retry: int = 0
 
     def need_update(self) -> bool:
         """根据配置的更新频率判断是否需要重新抓取。"""
-        return (
-            time.time() - self.last_fetch_time
-            > self.config_site["frequency_hours"] * 3600
-        )
+        now = time.time()
+        interval = self.config_site["frequency_hours"] * 3600
+        return now - self.last_fetch_time > interval and now > self.next_retry
 
     def next_update_time(self) -> int:
         """根据配置的更新频率计算下次更新时间。"""
-        return self.last_fetch_time + self.config_site["frequency_hours"] * 3600
+        interval = self.config_site["frequency_hours"] * 3600
+        return max(
+            self.last_fetch_time + interval,
+            self.next_retry,
+        )
 
 
 class RSSToolRepository:
@@ -124,6 +151,7 @@ class RSSToolRepository:
         self.db = typing.cast(aiosqlite.Connection, None)  # 延迟到 initialize()
         self.feeds = {}
         self.tags = {}
+        self._fetch_semaphore = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
 
     @property
     def allow_agents(self) -> bool:
@@ -194,6 +222,13 @@ CREATE TABLE IF NOT EXISTS items (
             "CREATE INDEX IF NOT EXISTS idx_items_unread ON items(unread)",
         )
 
+        await self._maybe_run_db_migration(
+            2,
+            "ALTER TABLE feeds ADD COLUMN etag TEXT DEFAULT ''",
+            "ALTER TABLE feeds ADD COLUMN fail_count INTEGER DEFAULT 0",
+            "ALTER TABLE feeds ADD COLUMN next_retry INTEGER DEFAULT 0",
+        )
+
         await self.sync_feeds_meta()
 
     async def close(self) -> None:
@@ -221,11 +256,19 @@ CREATE TABLE IF NOT EXISTS items (
         """
         self.config_saver.save_config()
 
-        # 从数据库加载已存储的 feed 记录: url -> (id, last_fetched)
-        stored: dict[str, tuple[int, int]] = {}
-        async with self.db.execute("SELECT id, url, last_fetched FROM feeds") as cursor:
+        # 从数据库加载已存储的 feed 记录: url -> (id, last_fetched, etag, fail_count, next_retry)
+        stored: dict[str, tuple[int, int, str, int, int]] = {}
+        async with self.db.execute(
+            "SELECT id, url, last_fetched, etag, fail_count, next_retry FROM feeds"
+        ) as cursor:
             for row in await cursor.fetchall():
-                stored[row[1]] = (row[0], row[2])
+                stored[row[1]] = (
+                    row[0],
+                    row[2],
+                    row[3] or "",
+                    row[4] or 0,
+                    row[5] or 0,
+                )
 
         self.feeds = {}
         self.tags = {}
@@ -233,9 +276,16 @@ CREATE TABLE IF NOT EXISTS items (
 
         for feed in self.config["feeds"]:
             if feed["url"] in stored:
-                db_id, last_fetch_time = stored[feed["url"]]
+                db_id, last_fetch_time, etag, fail_count, next_retry = stored[
+                    feed["url"]
+                ]
                 entry = RSSToolFeed(
-                    config_site=feed, id=db_id, last_fetch_time=last_fetch_time
+                    config_site=feed,
+                    id=db_id,
+                    last_fetch_time=last_fetch_time,
+                    etag=etag,
+                    fail_count=fail_count,
+                    next_retry=next_retry,
                 )
             else:
                 entry = RSSToolFeed(config_site=feed, id=0, last_fetch_time=0)
@@ -318,14 +368,50 @@ CREATE TABLE IF NOT EXISTS items (
     # ── Feed 抓取与更新 ─────────────────────────────────────────
 
     async def mark_up_to_date(self, feed: RSSToolFeed) -> None:
-        """将 Feed 的最后抓取时间更新为当前时间。"""
+        """将 Feed 的最后抓取时间更新为当前时间，同时持久化 etag 与退避状态。"""
         feed.last_fetch_time = int(time.time())
         async with self.db.execute(
-            "UPDATE feeds SET last_fetched = ? WHERE id = ?",
-            (feed.last_fetch_time, feed.id),
+            "UPDATE feeds SET last_fetched = ?, etag = ?, fail_count = ?, next_retry = ? WHERE id = ?",
+            (
+                feed.last_fetch_time,
+                feed.etag,
+                feed.fail_count,
+                feed.next_retry,
+                feed.id,
+            ),
         ) as cursor:
             await cursor.fetchone()
         await self.db.commit()
+
+    async def _record_failure(
+        self, feed: RSSToolFeed, retry_after_header: str | None = None
+    ) -> None:
+        """记录抓取失败，计算指数退避的下次重试时间。"""
+        feed.fail_count += 1
+        backoff = min(
+            BACKOFF_BASE_SECONDS * (BACKOFF_MULTIPLIER ** (feed.fail_count - 1)),
+            BACKOFF_MAX_SECONDS,
+        )
+        # 尝试解析 Retry-After 响应头
+        if retry_after_header:
+            try:
+                retry_after_seconds = int(retry_after_header)
+            except ValueError:
+                try:
+                    retry_date = parsedate_to_datetime(retry_after_header)
+                    retry_after_seconds = max(
+                        0, int(retry_date.timestamp() - time.time())
+                    )
+                except Exception:
+                    retry_after_seconds = 0
+            backoff = max(backoff, retry_after_seconds)
+        feed.next_retry = int(time.time() + backoff)
+        await self.mark_up_to_date(feed)
+
+    async def _reset_failure(self, feed: RSSToolFeed) -> None:
+        """重置抓取失败计数与退避状态。"""
+        feed.fail_count = 0
+        feed.next_retry = 0
 
     async def update_feed(self, feed: RSSToolFeed, force: bool = False) -> int:
         """抓取并解析单个 Feed，将新条目写入数据库。
@@ -340,6 +426,11 @@ CREATE TABLE IF NOT EXISTS items (
         if not force and not feed.need_update():
             return 0
 
+        async with self._fetch_semaphore:
+            return await self._do_fetch(feed)
+
+    async def _do_fetch(self, feed: RSSToolFeed) -> int:
+        """实际执行 Feed 抓取的内部方法。"""
         url = feed.config_site["url"]
 
         try:
@@ -353,24 +444,79 @@ CREATE TABLE IF NOT EXISTS items (
                     "Accept": REQUEST_ACCEPT,
                 },
             ) as session:
-                last_time = time.strftime(
-                    "%a, %d %b %Y %H:%M:%S GMT",
-                    time.gmtime(feed.last_fetch_time),
-                )
+                cond_headers: dict[str, str] = {
+                    "If-Modified-Since": time.strftime(
+                        "%a, %d %b %Y %H:%M:%S GMT",
+                        time.gmtime(feed.last_fetch_time),
+                    ),
+                }
+                if feed.etag:
+                    cond_headers["If-None-Match"] = feed.etag
+
+                # 首次请求：不自动跟随重定向，以便检测 301
                 async with session.get(
-                    url, headers={"If-Modified-Since": last_time}
+                    url,
+                    headers=cond_headers,
+                    allow_redirects=False,
                 ) as response:
-                    if response.status == 304:
+                    status = response.status
+                    resp_headers = response.headers
+
+                    # 304 Not Modified
+                    if status == 304:
+                        await self._reset_failure(feed)
                         await self.mark_up_to_date(feed)
                         return 0
-                    if response.status != 200:
-                        logger.warning(
-                            "RSS 抓取 HTTP 错误 [%s]: %s", url, response.status
-                        )
+
+                    # 301 永久重定向：更新存储的 URL
+                    if status == 301:
+                        new_url = resp_headers.get("Location", "")
+                        if new_url:
+                            logger.info("RSS 301 永久重定向 [%s] -> [%s]", url, new_url)
+                            feed.config_site["url"] = new_url
+                            self.config_saver.save_config()
+                            async with self.db.execute(
+                                "UPDATE feeds SET url = ? WHERE id = ?",
+                                (new_url, feed.id),
+                            ) as cur:
+                                await cur.fetchone()
+                            await self.db.commit()
+                            url = new_url
+
+                    # 其他 3xx 重定向 或 301 后：重新请求（跟随重定向）
+                    if 300 <= status < 400:
+                        async with session.get(
+                            url,
+                            headers=cond_headers,
+                            allow_redirects=True,
+                        ) as response2:
+                            status = response2.status
+                            resp_headers = response2.headers
+                            if status == 304:
+                                await self._reset_failure(feed)
+                                await self.mark_up_to_date(feed)
+                                return 0
+                            if status != 200:
+                                retry_after = resp_headers.get("Retry-After")
+                                logger.warning(
+                                    "RSS 抓取 HTTP 错误 [%s]: %s", url, status
+                                )
+                                await self._record_failure(feed, retry_after)
+                                return 0
+                            feed.etag = resp_headers.get("ETag", "")
+                            xml = await response2.content.read()
+                    elif status == 200:
+                        feed.etag = resp_headers.get("ETag", "")
+                        xml = await response.content.read()
+                    else:
+                        # 非 2xx/3xx/304：记录失败
+                        retry_after = resp_headers.get("Retry-After")
+                        logger.warning("RSS 抓取 HTTP 错误 [%s]: %s", url, status)
+                        await self._record_failure(feed, retry_after)
                         return 0
-                    xml = await response.content.read()
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning("RSS 抓取网络异常 [%s]: %s", url, e)
+            await self._record_failure(feed)
             return 0
 
         try:
@@ -379,7 +525,11 @@ CREATE TABLE IF NOT EXISTS items (
             )
         except Exception as e:
             logger.warning("RSS 解析失败 [%s]: %s", url, e)
+            await self._record_failure(feed)
             return 0
+
+        # 成功：重置失败计数
+        await self._reset_failure(feed)
 
         # 自动填充 Feed 标题
         if feed.config_site["title"] == "":
@@ -564,6 +714,59 @@ ON CONFLICT(link) DO UPDATE SET
         return "--- nothing found ---" if not formatted else "\n".join(formatted)
 
     # ── 订阅管理 ────────────────────────────────────────────────
+
+    async def discover_feed(self, url: str) -> str | None:
+        """校验并发现 Feed URL。
+
+        Args:
+            url: 订阅 URL。
+
+        Returns:
+            发现的 Feed URL，如果无法发现返回 None。
+        Raises:
+            aiohttp.ClientError
+        """
+        async with aiohttp.ClientSession(
+            trust_env=True,
+            timeout=REQUEST_TIMEOUT,
+            headers={
+                "User-Agent": str(self.config.get("user_agent") or "AstrBot RSS Tool"),
+                "Accept": REQUEST_ACCEPT,
+            },
+        ) as session:
+            async with session.get(url) as response:
+                content_type = (
+                    (response.content_type or "").split(";", 1)[0].strip(" \t")
+                )
+                if content_type in FEED_CONTENT_TYPES:
+                    return url
+
+                body = await response.content.read()
+
+        # 检查是否为 Feed 内容类型
+        try:
+            fastfeedparser.parse(body)
+            return url
+        except Exception:
+            logger.info("无法识别为 Feed 内容类型: %s，尝试解析为 HTML", url)
+
+        # 检查是否为 HTML
+        if "text/html" in content_type or body.lstrip()[:15].lower().startswith(
+            (b"<!doctype", b"<html")
+        ):
+            doc = lxml.html.fromstring(body)
+            for link_el in doc.iter("link"):
+                rel = (link_el.get("rel") or "").lower()
+                link_type = (link_el.get("type") or "").lower()
+                href = link_el.get("href") or ""
+                if (
+                    "alternate" in rel
+                    and any(ct in link_type for ct in FEED_CONTENT_TYPES)
+                    and href
+                ):
+                    logger.info("发现 Feed 链接: %s -> %s", url, href)
+                    return urljoin(url, href)
+            return None
 
     async def add_feed(self, url: str, tags: list[str]) -> None:
         """添加新的 Feed 订阅。"""

@@ -119,6 +119,14 @@ class RSSTool(Star):
 
         tags = self._parse_tags(comma_sep_tags)
 
+        try:
+            found = await self.repo.discover_feed(url)
+            if not found:
+                return "feed invalid" if llm else f"无法识别链接内容: {url}"
+        except Exception as e:
+            return f"connection error: {e}" if llm else f"连接错误: {e}"
+        url = found
+
         # 检查是否已存在相同 URL 的订阅
         same_url_sites = [site for site in self.repo.sites if site["url"] == url]
         if len(same_url_sites) > 0:

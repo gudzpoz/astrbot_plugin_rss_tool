@@ -138,6 +138,8 @@ class TestAddFeedCommonValidation:
         plugin.repo.sites = sites or []
         plugin.repo.sync_feeds_meta = AsyncMock()
         plugin.repo.add_feed = AsyncMock()
+        # discover_feed 默认返回原 URL（校验通过）
+        plugin.repo.discover_feed = AsyncMock(side_effect=lambda url: url)
         return plugin
 
     @pytest.mark.asyncio
@@ -174,6 +176,7 @@ class TestAddFeedCommonValidation:
             "tags": ["tech"],
         }
         plugin = self._make_plugin(sites=[existing_site])
+        # discover_feed 返回原 URL，但已存在
         result = await plugin.add_feed_common("https://example.com/feed.xml", "", False)
         assert "已存在" in result
 
@@ -195,6 +198,45 @@ class TestAddFeedCommonValidation:
         plugin = self._make_plugin()
         result = await plugin.add_feed_common("https://example.com/feed.xml", "", True)
         assert result == "ok"
+
+    @pytest.mark.asyncio
+    async def test_discover_feed_returns_different_url(self):
+        """当 discover_feed 返回不同 URL 时应使用发现的 URL。"""
+        plugin = self._make_plugin()
+        plugin.repo.discover_feed = AsyncMock(
+            return_value="https://example.com/real-feed.xml"
+        )
+        result = await plugin.add_feed_common("https://example.com/", "", False)
+        assert result == "添加成功"
+        call_args = plugin.repo.add_feed.call_args
+        assert call_args[0][0] == "https://example.com/real-feed.xml"
+
+    @pytest.mark.asyncio
+    async def test_discover_feed_raises_valueerror(self):
+        """当 discover_feed 报错时应返回错误信息。"""
+        plugin = self._make_plugin()
+        plugin.repo.discover_feed = AsyncMock(return_value=None)
+        result = await plugin.add_feed_common("https://example.com/", "", False)
+        assert "无法识别链接内容" in result
+        plugin.repo.add_feed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_discover_feed_raises_valueerror_llm(self):
+        """当 discover_feed 报错时 LLM 模式应返回英文错误。"""
+        plugin = self._make_plugin()
+        plugin.repo.discover_feed = AsyncMock(return_value=None)
+        result = await plugin.add_feed_common("https://example.com/", "", True)
+        assert "feed invalid" in result
+        plugin.repo.add_feed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_discover_feed_network_error(self):
+        """网络异常时应返回错误信息。"""
+        plugin = self._make_plugin()
+        plugin.repo.discover_feed = AsyncMock(side_effect=Exception("connection error"))
+        result = await plugin.add_feed_common("https://example.com/", "", False)
+        assert "连接错误" in result
+        plugin.repo.add_feed.assert_not_called()
 
 
 class TestMarkReadSemantics:

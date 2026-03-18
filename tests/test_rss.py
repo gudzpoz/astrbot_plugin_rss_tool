@@ -147,15 +147,15 @@ class TestRepositoryInit:
         assert "items" in tables
 
     async def test_db_version_set(self, repo: RSSToolRepository):
-        """初始化后 db_version 应为 '1'。"""
+        """初始化后 db_version 应为 '2'。"""
         version = await repo._get_config("db_version")
-        assert version == "1"
+        assert version == "2"
 
     async def test_double_initialize_idempotent(self, repo: RSSToolRepository):
         """重复初始化不应报错。"""
         await repo.initialize()
         version = await repo._get_config("db_version")
-        assert version == "1"
+        assert version == "2"
 
 
 @pytest.mark.asyncio
@@ -392,6 +392,7 @@ class TestRepositoryUpdateFeed:
 
         mock_response = AsyncMock()
         mock_response.status = 200
+        mock_response.headers = {"ETag": '"abc123"'}
         mock_response.content = MagicMock()
         mock_response.content.read = AsyncMock(return_value=sample_atom_xml)
         mock_response.__aenter__ = AsyncMock(return_value=mock_response)
@@ -409,6 +410,8 @@ class TestRepositoryUpdateFeed:
             result = await repo_with_feed.update_feed(feed, force=True)
 
         assert result == 2  # 2 entries in sample XML
+        assert feed.etag == '"abc123"'  # ETag 应被保存
+        assert feed.fail_count == 0  # 成功后应重置
 
     async def test_update_feed_304_not_modified(self, repo_with_feed):
         """304 响应应标记为最新但不添加条目。"""
@@ -417,6 +420,7 @@ class TestRepositoryUpdateFeed:
 
         mock_response = AsyncMock()
         mock_response.status = 304
+        mock_response.headers = {}
         mock_response.__aenter__ = AsyncMock(return_value=mock_response)
         mock_response.__aexit__ = AsyncMock(return_value=False)
 
@@ -433,6 +437,7 @@ class TestRepositoryUpdateFeed:
 
         assert result == 0
         assert feed.last_fetch_time > 0  # 应已更新时间戳
+        assert feed.fail_count == 0  # 304 也算成功
 
     async def test_update_feed_network_error(self, repo_with_feed):
         """网络异常应返回 0 而非抛出异常。"""
@@ -444,14 +449,301 @@ class TestRepositoryUpdateFeed:
             side_effect=Exception("connection refused"),
         ):
             # sync_feeds 使用 return_exceptions，但 update_feed 自身也应处理
-            # 这里直接测试 update_feed 的异常处理
             try:
                 result = await repo_with_feed.update_feed(feed, force=True)
-                # 如果没抛异常，结果应为 0
                 assert result == 0
             except Exception:
                 # ClientSession 构造失败会抛异常，这在 sync_feeds 中被 gather 捕获
                 pass
+
+
+@pytest.mark.asyncio
+class TestETagSupport:
+    """测试 ETag 条件请求支持。"""
+
+    async def test_etag_sent_in_request(self, repo_with_feed, sample_atom_xml):
+        """已有 ETag 时应发送 If-None-Match 头。"""
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        feed.last_fetch_time = 0
+        feed.etag = '"existing-etag"'
+
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.headers = {"ETag": '"new-etag"'}
+        mock_response.content = MagicMock()
+        mock_response.content.read = AsyncMock(return_value=sample_atom_xml)
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
+            await repo_with_feed.update_feed(feed, force=True)
+
+        # 验证请求头包含 If-None-Match
+        call_kwargs = mock_session.get.call_args
+        headers = (
+            call_kwargs.kwargs.get("headers", {})
+            if call_kwargs.kwargs
+            else call_kwargs[1].get("headers", {})
+        )
+        assert headers.get("If-None-Match") == '"existing-etag"'
+        assert feed.etag == '"new-etag"'
+
+    async def test_etag_persisted_to_db(self, repo_with_feed, sample_atom_xml):
+        """ETag 应被持久化到数据库。"""
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        feed.last_fetch_time = 0
+
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.headers = {"ETag": '"persisted-etag"'}
+        mock_response.content = MagicMock()
+        mock_response.content.read = AsyncMock(return_value=sample_atom_xml)
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
+            await repo_with_feed.update_feed(feed, force=True)
+
+        # 从数据库重新加载验证
+        async with repo_with_feed.db.execute(
+            "SELECT etag FROM feeds WHERE id = ?", (feed.id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            assert row[0] == '"persisted-etag"'
+
+
+@pytest.mark.asyncio
+class TestBackoff:
+    """测试指数退避与 Retry-After 支持。"""
+
+    async def test_failure_increments_fail_count(self, repo_with_feed):
+        """HTTP 错误应增加 fail_count。"""
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        feed.last_fetch_time = 0
+        assert feed.fail_count == 0
+
+        mock_response = AsyncMock()
+        mock_response.status = 500
+        mock_response.headers = {}
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
+            result = await repo_with_feed.update_feed(feed, force=True)
+
+        assert result == 0
+        assert feed.fail_count == 1
+        assert feed.next_retry > int(time.time())
+
+    async def test_backoff_skips_when_not_due(self, repo_with_feed):
+        """未到重试时间时应跳过抓取。"""
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        feed.last_fetch_time = 0  # 需要更新
+        feed.next_retry = int(time.time()) + 9999  # 远未到重试时间
+
+        result = await repo_with_feed.update_feed(feed)
+        assert result == 0
+
+    async def test_backoff_force_ignores_retry(self, repo_with_feed, sample_atom_xml):
+        """force=True 应忽略退避。"""
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        feed.last_fetch_time = 0
+        feed.next_retry = int(time.time()) + 9999
+
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.headers = {}
+        mock_response.content = MagicMock()
+        mock_response.content.read = AsyncMock(return_value=sample_atom_xml)
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
+            result = await repo_with_feed.update_feed(feed, force=True)
+
+        assert result == 2  # 成功抓取
+        assert feed.fail_count == 0  # 成功后重置
+        assert feed.next_retry == 0
+
+    async def test_success_resets_failure(self, repo_with_feed, sample_atom_xml):
+        """成功抓取后应重置 fail_count 和 next_retry。"""
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        feed.last_fetch_time = 0
+        feed.fail_count = 3
+        feed.next_retry = int(time.time()) - 1  # 已过重试时间
+
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.headers = {}
+        mock_response.content = MagicMock()
+        mock_response.content.read = AsyncMock(return_value=sample_atom_xml)
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
+            await repo_with_feed.update_feed(feed, force=True)
+
+        assert feed.fail_count == 0
+        assert feed.next_retry == 0
+
+    async def test_retry_after_header_seconds(self, repo_with_feed):
+        """Retry-After 为秒数时应使用较大值。"""
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        feed.last_fetch_time = 0
+
+        mock_response = AsyncMock()
+        mock_response.status = 429
+        mock_response.headers = {"Retry-After": "3600"}
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
+            await repo_with_feed.update_feed(feed, force=True)
+
+        assert feed.fail_count == 1
+        # Retry-After 3600 秒 > 默认退避 60 秒，应使用 3600
+        assert feed.next_retry >= int(time.time()) + 3500
+
+    async def test_exponential_backoff_increases(self, repo_with_feed):
+        """连续失败应指数增长退避时间。"""
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        feed.last_fetch_time = 0
+
+        mock_response = AsyncMock()
+        mock_response.status = 500
+        mock_response.headers = {}
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        retries = []
+        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
+            for _ in range(3):
+                feed.next_retry = 0  # 允许重试
+                await repo_with_feed.update_feed(feed, force=True)
+                retries.append(feed.next_retry)
+
+        assert feed.fail_count == 3
+        # 退避应递增：60, 120, 240 秒
+        assert retries[1] > retries[0]
+        assert retries[2] > retries[1]
+
+
+@pytest.mark.asyncio
+class TestPermanentRedirect:
+    """测试 301 永久重定向处理。"""
+
+    async def test_301_updates_stored_url(self, repo_with_feed, sample_atom_xml):
+        """301 应更新存储的 Feed URL。"""
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        feed.last_fetch_time = 0
+        original_url = feed.config_site["url"]
+
+        # 第一次请求返回 301
+        mock_301_response = AsyncMock()
+        mock_301_response.status = 301
+        mock_301_response.headers = {"Location": "https://new.example.com/feed.xml"}
+        mock_301_response.__aenter__ = AsyncMock(return_value=mock_301_response)
+        mock_301_response.__aexit__ = AsyncMock(return_value=False)
+
+        # 第二次请求（跟随重定向）返回 200
+        mock_200_response = AsyncMock()
+        mock_200_response.status = 200
+        mock_200_response.headers = {"ETag": '"new-etag"'}
+        mock_200_response.content = MagicMock()
+        mock_200_response.content.read = AsyncMock(return_value=sample_atom_xml)
+        mock_200_response.__aenter__ = AsyncMock(return_value=mock_200_response)
+        mock_200_response.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(side_effect=[mock_301_response, mock_200_response])
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
+            result = await repo_with_feed.update_feed(feed, force=True)
+
+        assert result == 2
+        assert feed.config_site["url"] == "https://new.example.com/feed.xml"
+        assert feed.config_site["url"] != original_url
+
+        # 验证数据库中也更新了
+        async with repo_with_feed.db.execute(
+            "SELECT url FROM feeds WHERE id = ?", (feed.id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            assert row[0] == "https://new.example.com/feed.xml"
+
+
+@pytest.mark.asyncio
+class TestConcurrencyLimit:
+    """测试并发抓取限制。"""
+
+    async def test_semaphore_exists(self, repo: RSSToolRepository):
+        """Repository 应有 _fetch_semaphore 属性。"""
+        import asyncio
+
+        assert hasattr(repo, "_fetch_semaphore")
+        assert isinstance(repo._fetch_semaphore, asyncio.Semaphore)
+
+
+@pytest.mark.asyncio
+class TestDbMigrationV2:
+    """测试数据库迁移 v2 新增列。"""
+
+    async def test_feeds_table_has_new_columns(self, repo: RSSToolRepository):
+        """feeds 表应包含 etag, fail_count, next_retry 列。"""
+        async with repo.db.execute("PRAGMA table_info(feeds)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+        assert "etag" in columns
+        assert "fail_count" in columns
+        assert "next_retry" in columns
+
+    async def test_db_version_is_2(self, repo: RSSToolRepository):
+        """迁移后 db_version 应为 '2'。"""
+        version = await repo._get_config("db_version")
+        assert version == "2"
+
+    async def test_new_columns_have_defaults(self, repo_with_feed: RSSToolRepository):
+        """新列应有正确的默认值。"""
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        assert feed.etag == ""
+        assert feed.fail_count == 0
+        assert feed.next_retry == 0
 
 
 @pytest.mark.asyncio

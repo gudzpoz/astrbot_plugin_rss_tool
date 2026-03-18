@@ -115,11 +115,20 @@ class RSSTool(Star):
         """
         url = url.strip()
         result = urllib.parse.urlparse(url)
+
+        # 简单的 SSRF（Server Side Request Forgery）检查
         if "." not in result.netloc or result.scheme not in ["http", "https"]:
             return (
                 "invalid link"
                 if llm
                 else f"无效的链接: {url}\n链接形式通常为 https://XXX.com/YYY.rss"
+            )
+        print(result.port, self.repo.config["allow_custom_ports"])
+        if not self.repo.config["allow_custom_ports"] and result.port:
+            return (
+                "port in link is not allowed"
+                if llm
+                else f"链接不允许指定端口: {url}\n链接形式通常为 https://XXX.com/YYY.rss"
             )
 
         tags = self._parse_tags(comma_sep_tags)

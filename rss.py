@@ -88,6 +88,7 @@ class RSSToolConfig(typing.TypedDict):
     feeds: list[RSSToolConfigSite]
     cleanup_days: int
     max_rss_size_mb: int
+    allow_custom_ports: bool
 
 
 class RSSToolQuery(typing.TypedDict, total=False):
@@ -459,7 +460,7 @@ CREATE TABLE IF NOT EXISTS items (
                 timeout=REQUEST_TIMEOUT,
                 headers={
                     "User-Agent": str(
-                        self.config.get("user_agent") or "AstrBot RSS Tool"
+                        self.config.get("user_agent") or "AstrBot-RSS-Tool"
                     ),
                     "Accept": REQUEST_ACCEPT,
                 },

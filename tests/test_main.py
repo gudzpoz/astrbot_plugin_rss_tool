@@ -140,6 +140,7 @@ class TestAddFeedCommonValidation:
         plugin.repo.add_feed = AsyncMock()
         # discover_feed 默认返回原 URL（校验通过）
         plugin.repo.discover_feed = AsyncMock(side_effect=lambda url: url)
+        plugin.repo.config = {"allow_custom_ports": False}
         return plugin
 
     @pytest.mark.asyncio
@@ -153,6 +154,12 @@ class TestAddFeedCommonValidation:
         plugin = self._make_plugin()
         result = await plugin.add_feed_common("https://localhost/rss", "", False)
         assert "无效的链接" in result
+
+    @pytest.mark.asyncio
+    async def test_invalid_url_with_port(self):
+        plugin = self._make_plugin()
+        result = await plugin.add_feed_common("https://example.com:8080/rss", "", False)
+        assert "链接不允许指定端口" in result
 
     @pytest.mark.asyncio
     async def test_invalid_url_llm_mode(self):

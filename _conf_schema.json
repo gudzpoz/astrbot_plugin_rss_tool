@@ -7,7 +7,7 @@
   "user_agent": {
     "description": "User-Agent",
     "type": "string",
-    "default": "AstrBot RSS Tool"
+    "default": "AstrBot-RSS-Tool"
   },
   "cleanup_days": {
     "description": "自动清除多少天前的旧条目（0 表示不清除）",
@@ -55,5 +55,10 @@
     "hint": "避免恶意 RSS 的攻击，单位：MB（0 表示不限制）",
     "type": "int",
     "default": 10
+  },
+  "allow_custom_ports": {
+    "description": "是否允许链接指定端口（有安全风险）",
+    "type": "bool",
+    "default": false
   }
 }

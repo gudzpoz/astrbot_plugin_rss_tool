@@ -285,7 +285,7 @@ class RSSTool(Star):
         return "\n".join(lines) if lines else "no subscriptions"
 
     @filter.llm_tool(name="rss_tool_query")
-    async def rss_tool_query(self, _: AstrMessageEvent, columns: str, query: object):
+    async def rss_tool_query(self, _: AstrMessageEvent, columns: str, query: dict):
         """Query Atom/RSS feed entries.
 
         Args:

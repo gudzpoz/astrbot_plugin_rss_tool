@@ -616,18 +616,18 @@ ON CONFLICT(link) DO UPDATE SET
 
     # ── 查询 ────────────────────────────────────────────────────
 
-    async def query(self, fields: str, query: object, mark_as_read: bool) -> list[str]:
+    async def query(self, fields: str, query_dict: dict, mark_as_read: bool) -> list[str]:
         """查询 Feed 条目并返回格式化文本。
 
         Args:
             fields: 逗号分隔的列名（白名单过滤）。
-            query: 查询参数对象，参见 RSSToolQuery。
+            query_dict: 查询参数对象，参见 RSSToolQuery。
             mark_as_read: 是否将返回的条目标记为已读。
 
         Returns:
             格式化的查询结果文本，无结果时返回 "--- nothing found ---"。
         """
-        query = typing.cast(RSSToolQuery, query)
+        query = typing.cast(RSSToolQuery, query_dict)
 
         # 白名单过滤列名，防止 SQL 注入
         field_names = [

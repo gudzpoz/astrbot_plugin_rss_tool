@@ -472,3 +472,180 @@ class TestRepositorySyncFeeds:
         sync_time = repo_with_feed.next_sync_time()
         assert isinstance(sync_time, datetime)
         assert sync_time.timestamp() >= time.time()
+
+
+@pytest.mark.asyncio
+class TestPurgeOldItems:
+    """测试 purge_old_items 定期清除旧条目功能。"""
+
+    async def _insert_item(
+        self,
+        repo: RSSToolRepository,
+        feed_id: int,
+        link: str,
+        published: int,
+        unread: int = 1,
+    ) -> None:
+        """辅助方法：插入一条指定发布时间和已读状态的条目。"""
+        await repo.db.execute(
+            "INSERT INTO items (feed_id, title, link, published, unread) VALUES (?, ?, ?, ?, ?)",
+            (feed_id, f"Title {link}", link, published, unread),
+        )
+        await repo.db.commit()
+
+    async def test_purge_disabled_by_zero(self, repo_with_feed: RSSToolRepository):
+        """cleanup_days=0 时不应清除任何条目。"""
+        repo_with_feed.config["cleanup_days"] = 0
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        old_ts = int(time.time()) - 90 * 86400
+        await self._insert_item(repo_with_feed, feed.id, "https://old/1", old_ts, unread=0)
+
+        deleted = await repo_with_feed.purge_old_items()
+        assert deleted == 0
+
+        # 条目应仍然存在
+        async with repo_with_feed.db.execute("SELECT COUNT(*) FROM items") as cur:
+            row = await cur.fetchone()
+            assert row
+            assert row[0] == 1
+
+    async def test_purge_read_items_older_than_n_days(
+        self, repo_with_feed: RSSToolRepository
+    ):
+        """已读且超过 N 天的条目应被清除。"""
+        repo_with_feed.config["cleanup_days"] = 30
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        old_ts = int(time.time()) - 31 * 86400
+        recent_ts = int(time.time()) - 1 * 86400
+
+        # 旧已读 — 应被清除
+        await self._insert_item(repo_with_feed, feed.id, "https://old-read/1", old_ts, unread=0)
+        # 新已读 — 不应被清除
+        await self._insert_item(repo_with_feed, feed.id, "https://new-read/1", recent_ts, unread=0)
+        # 旧未读（enabled feed）— 不应被清除
+        await self._insert_item(repo_with_feed, feed.id, "https://old-unread/1", old_ts, unread=1)
+
+        deleted = await repo_with_feed.purge_old_items()
+        assert deleted == 1
+
+        async with repo_with_feed.db.execute("SELECT COUNT(*) FROM items") as cur:
+            row = await cur.fetchone()
+            assert row
+            assert row[0] == 2
+
+    async def test_purge_unread_items_from_disabled_feed(
+        self, repo_with_feed: RSSToolRepository
+    ):
+        """已禁用 Feed 中超过 N 天的未读条目应被清除。"""
+        repo_with_feed.config["cleanup_days"] = 30
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        feed.config_site["enabled"] = False
+        old_ts = int(time.time()) - 31 * 86400
+
+        # 旧未读 + disabled feed — 应被清除
+        await self._insert_item(repo_with_feed, feed.id, "https://old-unread-disabled/1", old_ts, unread=1)
+
+        deleted = await repo_with_feed.purge_old_items()
+        assert deleted == 1
+
+        async with repo_with_feed.db.execute("SELECT COUNT(*) FROM items") as cur:
+            row = await cur.fetchone()
+            assert row
+            assert row[0] == 0
+
+    async def test_purge_keeps_unread_items_from_enabled_feed(
+        self, repo_with_feed: RSSToolRepository
+    ):
+        """已启用 Feed 中超过 N 天的未读条目不应被清除。"""
+        repo_with_feed.config["cleanup_days"] = 30
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        assert feed.config_site["enabled"] is True
+        old_ts = int(time.time()) - 31 * 86400
+
+        await self._insert_item(repo_with_feed, feed.id, "https://old-unread-enabled/1", old_ts, unread=1)
+
+        deleted = await repo_with_feed.purge_old_items()
+        assert deleted == 0
+
+        async with repo_with_feed.db.execute("SELECT COUNT(*) FROM items") as cur:
+            row = await cur.fetchone()
+            assert row
+            assert row[0] == 1
+
+    async def test_purge_mixed_scenario(self, tmp_path):
+        """混合场景：多个 Feed，不同 enabled 状态，不同已读状态。"""
+        import json
+        from pathlib import Path
+
+        conf_path = tmp_path / "cfg.json"
+        feeds_cfg = [
+            {
+                "__template_key": "site",
+                "url": "https://enabled.com/feed",
+                "enabled": True,
+                "title": "Enabled Feed",
+                "tags": [],
+                "frequency_hours": 6,
+            },
+            {
+                "__template_key": "site",
+                "url": "https://disabled.com/feed",
+                "enabled": False,
+                "title": "Disabled Feed",
+                "tags": [],
+                "frequency_hours": 6,
+            },
+        ]
+        default = {"allow_agents": True, "user_agent": "Test", "cleanup_days": 7, "feeds": feeds_cfg}
+        conf_path.write_text(json.dumps(default), encoding="utf-8")
+
+        from astrbot.api import AstrBotConfig
+        config = AstrBotConfig(config_path=str(conf_path), default_config=default)
+        repo = RSSToolRepository(tmp_path / "test.db", config)
+        await repo.initialize()
+
+        enabled_feed = repo.feeds["https://enabled.com/feed"]
+        disabled_feed = repo.feeds["https://disabled.com/feed"]
+        old_ts = int(time.time()) - 8 * 86400
+        recent_ts = int(time.time()) - 1 * 86400
+
+        # enabled feed: 旧已读 → 清除
+        await self._insert_item(repo, enabled_feed.id, "https://e/old-read", old_ts, unread=0)
+        # enabled feed: 旧未读 → 保留
+        await self._insert_item(repo, enabled_feed.id, "https://e/old-unread", old_ts, unread=1)
+        # enabled feed: 新已读 → 保留
+        await self._insert_item(repo, enabled_feed.id, "https://e/new-read", recent_ts, unread=0)
+        # disabled feed: 旧未读 → 清除
+        await self._insert_item(repo, disabled_feed.id, "https://d/old-unread", old_ts, unread=1)
+        # disabled feed: 旧已读 → 清除
+        await self._insert_item(repo, disabled_feed.id, "https://d/old-read", old_ts, unread=0)
+        # disabled feed: 新未读 → 保留
+        await self._insert_item(repo, disabled_feed.id, "https://d/new-unread", recent_ts, unread=1)
+
+        deleted = await repo.purge_old_items()
+        assert deleted == 3  # e/old-read + d/old-unread + d/old-read
+
+        async with repo.db.execute(
+            "SELECT link FROM items ORDER BY link"
+        ) as cur:
+            remaining = [row[0] for row in await cur.fetchall()]
+        assert remaining == [
+            "https://d/new-unread",
+            "https://e/new-read",
+            "https://e/old-unread",
+        ]
+
+        await repo.close()
+
+    async def test_purge_default_config_missing_key(self, repo_with_feed: RSSToolRepository):
+        """配置中无 cleanup_days 时应使用默认值 30 天。"""
+        # 确保 config 中没有 cleanup_days 键
+        repo_with_feed.config.pop("cleanup_days", None)
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        old_ts = int(time.time()) - 91 * 86400
+
+        await self._insert_item(repo_with_feed, feed.id, "https://default/1", old_ts, unread=0)
+
+        # 默认 30 天，31 天前的已读条目应被清除
+        deleted = await repo_with_feed.purge_old_items()
+        assert deleted == 1

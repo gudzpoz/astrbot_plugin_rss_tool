@@ -63,6 +63,7 @@ class RSSToolConfig(typing.TypedDict):
     allow_agents: bool
     user_agent: str
     feeds: list[RSSToolConfigSite]
+    cleanup_days: int
 
 
 class RSSToolQuery(typing.TypedDict, total=False):
@@ -278,6 +279,43 @@ CREATE TABLE IF NOT EXISTS items (
                 logger.warning(
                     "RSS 抓取失败 [%s]: %s", feed_entry.config_site["url"], result
                 )
+
+        await self.purge_old_items()
+
+    async def purge_old_items(self) -> int:
+        """清除过期的旧条目。
+
+        清除条件：
+        - 已读条目：发布时间超过 cleanup_days 天
+        - 未读条目：发布时间超过 cleanup_days 天，且所属 Feed 未启用（禁用或已删除）
+
+        Returns:
+            被清除的条目数量。
+        """
+        days = int(self.config.get("cleanup_days", 60) or 0)
+        if days <= 0:
+            return 0
+
+        cutoff = int(time.time()) - days * 86400
+        feed_ids = {
+            f.id for f in self.feeds.values() if f.config_site["enabled"]
+        }
+
+        # 条件：发布时间 < cutoff 且 非（未读 且 feed 已启用）
+        enabled_placeholders = ",".join("?" for _ in feed_ids)
+        sql = (
+            "DELETE FROM items WHERE published < ? AND "
+            f"NOT (unread = 1 AND feed_id IN ({enabled_placeholders}))"
+        )
+        params: list[int] = [cutoff, *feed_ids]
+
+        async with self.db.execute(sql, params) as cursor:
+            await cursor.fetchall()
+            deleted = cursor.rowcount
+        if deleted > 0:
+            await self.db.commit()
+            logger.info("RSS 已清除 %d 条过期条目（超过 %d 天）", deleted, days)
+        return deleted
 
     # ── Feed 抓取与更新 ─────────────────────────────────────────
 

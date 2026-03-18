@@ -9,6 +9,12 @@
     "type": "string",
     "default": "AstrBot RSS Tool"
   },
+  "cleanup_days": {
+    "description": "自动清除多少天前的旧条目（0 表示不清除）",
+    "hint": "已读条目和已禁用订阅的未读条目在超过该天数后会被自动清除。",
+    "type": "int",
+    "default": 60
+  },
   "feeds": {
     "description": "RSS 订阅列表",
     "hint": "若手动添加太麻烦，也可让 Agent 自动添加。",

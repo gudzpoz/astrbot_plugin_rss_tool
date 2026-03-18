@@ -206,11 +206,10 @@ class RSSTool(Star):
     @feed.command("frequency")
     async def feed_frequency(self, event: AstrMessageEvent, url: str, hours: int):
         """修改 Feed 更新频率（小时）"""
-        yield event.plain_result(
-            "修改成功"
-            if await self.repo.set_feed_frequency(url, hours)
-            else "未找到该订阅"
-        )
+        ok = await self.repo.set_feed_frequency(url, hours)
+        if ok:
+            self.add_cron_job()
+        yield event.plain_result("修改成功" if ok else "未找到该订阅")
 
     @feed.command("read")
     async def feed_read(self, event: AstrMessageEvent, url: str = "", tag: str = ""):

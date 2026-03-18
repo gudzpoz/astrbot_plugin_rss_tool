@@ -43,6 +43,8 @@ REQUEST_ACCEPT = (
 
 # 网络请求默认超时（秒）
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
+# 最大重定向次数
+MAX_REDIRECTS = 10
 
 # query() 允许的列名白名单
 ALLOWED_QUERY_COLUMNS = frozenset(
@@ -85,6 +87,7 @@ class RSSToolConfig(typing.TypedDict):
     user_agent: str
     feeds: list[RSSToolConfigSite]
     cleanup_days: int
+    max_rss_size_mb: int
 
 
 class RSSToolQuery(typing.TypedDict, total=False):
@@ -470,11 +473,11 @@ CREATE TABLE IF NOT EXISTS items (
                 if feed.etag:
                     cond_headers["If-None-Match"] = feed.etag
 
-                # 首次请求：不自动跟随重定向，以便检测 301
                 async with session.get(
                     url,
                     headers=cond_headers,
-                    allow_redirects=False,
+                    allow_redirects=True,
+                    max_redirects=MAX_REDIRECTS,
                 ) as response:
                     status = response.status
                     resp_headers = response.headers
@@ -486,45 +489,21 @@ CREATE TABLE IF NOT EXISTS items (
                         return 0
 
                     # 301 永久重定向：更新存储的 URL
-                    if status == 301:
-                        new_url = resp_headers.get("Location", "")
-                        if new_url:
-                            new_url = urljoin(url, new_url)
-                            logger.info("RSS 301 永久重定向 [%s] -> [%s]", url, new_url)
-                            feed.config_site["url"] = new_url
-                            self.config_saver.save_config()
-                            await self.db.execute(
-                                "UPDATE feeds SET url = ? WHERE id = ?",
-                                (new_url, feed.id),
-                            )
-                            await self.db.commit()
-                            url = new_url
+                    redirected = self._redirected_url(url, response)
+                    if redirected != url:
+                        logger.info("RSS 301 永久重定向 [%s] -> [%s]", url, redirected)
+                        feed.config_site["url"] = redirected
+                        self.config_saver.save_config()
+                        await self.db.execute(
+                            "UPDATE feeds SET url = ? WHERE id = ?",
+                            (redirected, feed.id),
+                        )
+                        await self.db.commit()
+                        url = redirected
 
-                    # 其他 3xx 重定向 或 301 后：重新请求（跟随重定向）
-                    if 300 <= status < 400:
-                        async with session.get(
-                            url,
-                            headers=cond_headers,
-                            allow_redirects=True,
-                        ) as response2:
-                            status = response2.status
-                            resp_headers = response2.headers
-                            if status == 304:
-                                await self._reset_failure(feed)
-                                await self.mark_up_to_date(feed)
-                                return 0
-                            if status != 200:
-                                retry_after = resp_headers.get("Retry-After")
-                                logger.warning(
-                                    "RSS 抓取 HTTP 错误 [%s]: %s", url, status
-                                )
-                                await self._record_failure(feed, retry_after)
-                                return 0
-                            feed.etag = resp_headers.get("ETag", "")
-                            xml = await response2.content.read()
-                    elif status == 200:
+                    if status == 200:
                         feed.etag = resp_headers.get("ETag", "")
-                        xml = await response.content.read()
+                        xml = await self._bounded_read(response)
                     else:
                         # 非 2xx/3xx/304：记录失败
                         retry_after = resp_headers.get("Retry-After")
@@ -533,6 +512,11 @@ CREATE TABLE IF NOT EXISTS items (
                         return 0
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning("RSS 抓取网络异常 [%s]: %s", url, e)
+            await self._record_failure(feed)
+            return 0
+
+        if xml is None:
+            logger.warning("RSS 文件过大 [%s]", url)
             await self._record_failure(feed)
             return 0
 
@@ -757,14 +741,18 @@ ON CONFLICT(link) DO UPDATE SET
                 "Accept": REQUEST_ACCEPT,
             },
         ) as session:
-            async with session.get(url) as response:
+            async with session.get(url, max_redirects=MAX_REDIRECTS) as response:
                 content_type = (
                     (response.content_type or "").split(";", 1)[0].strip(" \t")
                 )
                 if content_type in FEED_CONTENT_TYPES:
                     return url
 
-                body = await response.content.read()
+                body = await self._bounded_read(response)
+
+        if body is None:
+            logger.info("RSS 文件过大: %s", url)
+            return None
 
         # 检查是否为 Feed 内容类型
         try:
@@ -929,6 +917,28 @@ ON CONFLICT(link) DO UPDATE SET
             count = cursor.rowcount
         await self.db.commit()
         return count
+
+    async def _bounded_read(self, response: aiohttp.ClientResponse) -> bytes | None:
+        max_length = self.config.get("max_rss_size_mb", 10) * 1024 * 1024
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None and int(content_length) > max_length:
+            return None
+        return await response.content.read(
+            int(content_length) if content_length else max_length
+        )
+
+    @staticmethod
+    def _redirected_url(url: str, response: aiohttp.ClientResponse) -> str:
+        """获取 301 永久重定向后的 URL。"""
+        for redir in response.history:
+            if redir.status == 301:
+                new_url = redir.headers.get("Location", "")
+                if new_url:
+                    new_url = urljoin(url, new_url)
+                    url = new_url
+                    continue
+            break
+        return url
 
 
 def _prune_html(text: str) -> str:

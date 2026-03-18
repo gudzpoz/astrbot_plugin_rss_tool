@@ -49,5 +49,11 @@
         }
       }
     }
+  },
+  "max_rss_size_mb": {
+    "description": "最大 RSS 下载大小",
+    "hint": "避免恶意 RSS 的攻击，单位：MB（0 表示不限制）",
+    "type": "int",
+    "default": 10
   }
 }

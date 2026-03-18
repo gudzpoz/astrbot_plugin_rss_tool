@@ -477,6 +477,32 @@ class TestRepositoryUpdateFeed:
             result = await repo_with_feed.update_feed(feed, force=True)
             assert result == 0
 
+    async def test_update_feed_size_huge(self, repo_with_feed):
+        """大于 10MB（默认）的 Feed 不应抓取。"""
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        feed.last_fetch_time = 0  # 强制需要更新
+
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.headers = {"Content-Length": "100000000"}
+        mock_response.content = MagicMock()
+        mock_response.content.read = AsyncMock(side_effect=Exception("should not read"))
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(
+            "rss.aiohttp.ClientSession",
+            return_value=mock_session,
+        ):
+            result = await repo_with_feed.update_feed(feed, force=True)
+
+        assert result == 0
+
 
 @pytest.mark.asyncio
 class TestETagSupport:
@@ -694,30 +720,32 @@ class TestPermanentRedirect:
         feed.last_fetch_time = 0
         original_url = feed.config_site["url"]
 
-        # 第一次请求返回 301
+        # 历史请求返回 301
         mock_301_response = AsyncMock()
         mock_301_response.status = 301
         mock_301_response.headers = {"Location": "https://new.example.com/feed.xml"}
         mock_301_response.__aenter__ = AsyncMock(return_value=mock_301_response)
         mock_301_response.__aexit__ = AsyncMock(return_value=False)
 
-        # 第二次请求（跟随重定向）返回 200
+        # 跟随重定向返回 200
         mock_200_response = AsyncMock()
         mock_200_response.status = 200
         mock_200_response.headers = {"ETag": '"new-etag"'}
         mock_200_response.content = MagicMock()
         mock_200_response.content.read = AsyncMock(return_value=sample_atom_xml)
+        mock_200_response.history = [mock_301_response]
         mock_200_response.__aenter__ = AsyncMock(return_value=mock_200_response)
         mock_200_response.__aexit__ = AsyncMock(return_value=False)
 
         mock_session = MagicMock()
-        mock_session.get = MagicMock(side_effect=[mock_301_response, mock_200_response])
+        mock_session.get = MagicMock(return_value=mock_200_response)
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
         with patch("rss.aiohttp.ClientSession", return_value=mock_session):
             result = await repo_with_feed.update_feed(feed, force=True)
 
+        assert mock_session.get.call_count == 1
         assert result == 2
         assert feed.config_site["url"] == "https://new.example.com/feed.xml"
         assert feed.config_site["url"] != original_url

@@ -160,6 +160,8 @@ class TestAddFeedCommonValidation:
         plugin = self._make_plugin()
         result = await plugin.add_feed_common("https://example.com:8080/rss", "", False)
         assert "链接不允许指定端口" in result
+        result = await plugin.add_feed_common("https://example.com:abc/rss", "", False)
+        assert "链接不允许指定端口" in result
 
     @pytest.mark.asyncio
     async def test_invalid_url_llm_mode(self):
@@ -219,8 +221,8 @@ class TestAddFeedCommonValidation:
         assert call_args[0][0] == "https://example.com/real-feed.xml"
 
     @pytest.mark.asyncio
-    async def test_discover_feed_raises_valueerror(self):
-        """当 discover_feed 报错时应返回错误信息。"""
+    async def test_discover_feed_not_found(self):
+        """当 discover_feed 无结果时应返回错误信息。"""
         plugin = self._make_plugin()
         plugin.repo.discover_feed = AsyncMock(return_value=None)
         result = await plugin.add_feed_common("https://example.com/", "", False)
@@ -228,8 +230,8 @@ class TestAddFeedCommonValidation:
         plugin.repo.add_feed.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_discover_feed_raises_valueerror_llm(self):
-        """当 discover_feed 报错时 LLM 模式应返回英文错误。"""
+    async def test_discover_feed_not_found_llm(self):
+        """当 discover_feed 无结果时 LLM 模式应返回英文错误。"""
         plugin = self._make_plugin()
         plugin.repo.discover_feed = AsyncMock(return_value=None)
         result = await plugin.add_feed_common("https://example.com/", "", True)

@@ -7,7 +7,7 @@ HTML 清理、URL 清理、mark_read 等。
 import json
 import time
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 import pytest
@@ -408,7 +408,8 @@ class TestRepositoryUpdateFeed:
         """未到更新时间时应跳过抓取。"""
         feed = repo_with_feed.feeds["https://example.com/feed.xml"]
         feed.last_fetch_time = int(time.time())  # 刚刚更新过
-        result = await repo_with_feed.update_feed(feed)
+        mock = AsyncMock()
+        result = await repo_with_feed.update_feed(feed, mock)
         assert result == 0
 
     async def test_update_feed_force(self, repo_with_feed, sample_atom_xml):
@@ -426,14 +427,8 @@ class TestRepositoryUpdateFeed:
 
         mock_session = MagicMock()
         mock_session.get = MagicMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch(
-            "rss.aiohttp.ClientSession",
-            return_value=mock_session,
-        ):
-            result = await repo_with_feed.update_feed(feed, force=True)
+        result = await repo_with_feed.update_feed(feed, mock_session, force=True)
 
         assert result == 2  # 2 entries in sample XML
         assert feed.etag == '"abc123"'  # ETag 应被保存
@@ -452,14 +447,8 @@ class TestRepositoryUpdateFeed:
 
         mock_session = MagicMock()
         mock_session.get = MagicMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch(
-            "rss.aiohttp.ClientSession",
-            return_value=mock_session,
-        ):
-            result = await repo_with_feed.update_feed(feed, force=True)
+        result = await repo_with_feed.update_feed(feed, mock_session, force=True)
 
         assert result == 0
         assert feed.last_fetch_time > 0  # 应已更新时间戳
@@ -470,12 +459,11 @@ class TestRepositoryUpdateFeed:
         feed = repo_with_feed.feeds["https://example.com/feed.xml"]
         feed.last_fetch_time = 0
 
-        with patch(
-            "rss.aiohttp.ClientSession",
-            side_effect=aiohttp.ClientError("connection refused"),
-        ):
-            result = await repo_with_feed.update_feed(feed, force=True)
-            assert result == 0
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(side_effect=aiohttp.ClientError("network error"))
+
+        result = await repo_with_feed.update_feed(feed, mock_session, force=True)
+        assert result == 0
 
     async def test_update_feed_size_huge(self, repo_with_feed):
         """大于 10MB（默认）的 Feed 不应抓取。"""
@@ -492,14 +480,8 @@ class TestRepositoryUpdateFeed:
 
         mock_session = MagicMock()
         mock_session.get = MagicMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch(
-            "rss.aiohttp.ClientSession",
-            return_value=mock_session,
-        ):
-            result = await repo_with_feed.update_feed(feed, force=True)
+        result = await repo_with_feed.update_feed(feed, mock_session, force=True)
 
         assert result == 0
 
@@ -524,11 +506,8 @@ class TestETagSupport:
 
         mock_session = MagicMock()
         mock_session.get = MagicMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
-            await repo_with_feed.update_feed(feed, force=True)
+        await repo_with_feed.update_feed(feed, mock_session, force=True)
 
         # 验证请求头包含 If-None-Match
         call_kwargs = mock_session.get.call_args
@@ -555,11 +534,8 @@ class TestETagSupport:
 
         mock_session = MagicMock()
         mock_session.get = MagicMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
-            await repo_with_feed.update_feed(feed, force=True)
+        await repo_with_feed.update_feed(feed, mock_session, force=True)
 
         # 从数据库重新加载验证
         async with repo_with_feed.db.execute(
@@ -587,11 +563,8 @@ class TestBackoff:
 
         mock_session = MagicMock()
         mock_session.get = MagicMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
-            result = await repo_with_feed.update_feed(feed, force=True)
+        result = await repo_with_feed.update_feed(feed, mock_session, force=True)
 
         assert result == 0
         assert feed.fail_count == 1
@@ -603,7 +576,10 @@ class TestBackoff:
         feed.last_fetch_time = 0  # 需要更新
         feed.next_retry = int(time.time()) + 9999  # 远未到重试时间
 
-        result = await repo_with_feed.update_feed(feed)
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(side_effect=Exception("should not be called"))
+
+        result = await repo_with_feed.update_feed(feed, mock_session)
         assert result == 0
 
     async def test_backoff_force_ignores_retry(self, repo_with_feed, sample_atom_xml):
@@ -622,11 +598,8 @@ class TestBackoff:
 
         mock_session = MagicMock()
         mock_session.get = MagicMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
-            result = await repo_with_feed.update_feed(feed, force=True)
+        result = await repo_with_feed.update_feed(feed, mock_session, force=True)
 
         assert result == 2  # 成功抓取
         assert feed.fail_count == 0  # 成功后重置
@@ -649,11 +622,8 @@ class TestBackoff:
 
         mock_session = MagicMock()
         mock_session.get = MagicMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
-            await repo_with_feed.update_feed(feed, force=True)
+        await repo_with_feed.update_feed(feed, mock_session, force=True)
 
         assert feed.fail_count == 0
         assert feed.next_retry == 0
@@ -671,11 +641,8 @@ class TestBackoff:
 
         mock_session = MagicMock()
         mock_session.get = MagicMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
-            await repo_with_feed.update_feed(feed, force=True)
+        await repo_with_feed.update_feed(feed, mock_session, force=True)
 
         assert feed.fail_count == 1
         # Retry-After 3600 秒 > 默认退避 60 秒，应使用 3600
@@ -694,15 +661,12 @@ class TestBackoff:
 
         mock_session = MagicMock()
         mock_session.get = MagicMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
 
         retries = []
-        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
-            for _ in range(3):
-                feed.next_retry = 0  # 允许重试
-                await repo_with_feed.update_feed(feed, force=True)
-                retries.append(feed.next_retry)
+        for _ in range(3):
+            feed.next_retry = 0  # 允许重试
+            await repo_with_feed.update_feed(feed, mock_session, force=True)
+            retries.append(feed.next_retry)
 
         assert feed.fail_count == 3
         # 退避应递增：60, 120, 240 秒
@@ -739,11 +703,8 @@ class TestPermanentRedirect:
 
         mock_session = MagicMock()
         mock_session.get = MagicMock(return_value=mock_200_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("rss.aiohttp.ClientSession", return_value=mock_session):
-            result = await repo_with_feed.update_feed(feed, force=True)
+        result = await repo_with_feed.update_feed(feed, mock_session, force=True)
 
         assert mock_session.get.call_count == 1
         assert result == 2

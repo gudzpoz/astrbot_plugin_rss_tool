@@ -54,8 +54,8 @@ class RSSTool(Star):
         """更新定时任务，定时同步 Feed。"""
         try:
             await self.repo.sync_feeds()
-        except Exception as e:
-            logger.exception("RSS Tool Feed 同步异常", exc_info=e)
+        except Exception:
+            logger.exception("RSS Tool Feed 同步异常")
         finally:
             self.add_cron_job()
 
@@ -123,13 +123,18 @@ class RSSTool(Star):
                 if llm
                 else f"无效的链接: {url}\n链接形式通常为 https://XXX.com/YYY.rss"
             )
-        print(result.port, self.repo.config["allow_custom_ports"])
-        if not self.repo.config["allow_custom_ports"] and result.port:
-            return (
-                "port in link is not allowed"
-                if llm
-                else f"链接不允许指定端口: {url}\n链接形式通常为 https://XXX.com/YYY.rss"
-            )
+        if not self.repo.config.get("allow_custom_ports"):
+            has_port = False
+            try:
+                has_port = result.port is not None
+            except ValueError:
+                has_port = True
+            if has_port:
+                return (
+                    "port in link is not allowed"
+                    if llm
+                    else f"链接不允许指定端口: {url}\n链接形式通常为 https://XXX.com/YYY.rss"
+                )
 
         tags = self._parse_tags(comma_sep_tags)
 

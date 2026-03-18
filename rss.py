@@ -14,7 +14,7 @@ import re
 import time
 import typing
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import ParseResult, parse_qs, urlencode, urljoin, urlparse, urlunparse
@@ -68,16 +68,19 @@ FEED_CONTENT_TYPES = (
     "text/xml",
 )
 
-
-class RSSToolConfigSite(typing.TypedDict):
-    """单个 Feed 订阅的配置项，与 _conf_schema.json 中 feeds 模板对应。"""
-
-    __template_key: str
-    url: str
-    enabled: bool
-    title: str
-    tags: list[str]
-    frequency_hours: int
+# 单个 Feed 订阅的配置项，与 _conf_schema.json 中 feeds 模板对应。
+# 不使用 class 语法以避免 name mangling。
+RSSToolConfigSite = typing.TypedDict(
+    "RSSToolConfigSite",
+    {
+        "__template_key": str,
+        "url": str,
+        "enabled": bool,
+        "title": str,
+        "tags": list[str],
+        "frequency_hours": int,
+    },
+)
 
 
 class RSSToolConfig(typing.TypedDict):
@@ -218,7 +221,7 @@ CREATE TABLE IF NOT EXISTS items (
     id INTEGER PRIMARY KEY AUTOINCREMENT, feed_id INTEGER, title TEXT,
     link TEXT, description TEXT, published INTEGER, author TEXT, content TEXT,
     unread INTEGER DEFAULT 1,
-    UNIQUE(link)
+    UNIQUE(feed_id, link)
 )""",
             "CREATE INDEX IF NOT EXISTS idx_items_feed_id ON items(feed_id, published)",
             "CREATE INDEX IF NOT EXISTS idx_items_published ON items(published)",
@@ -328,10 +331,18 @@ CREATE TABLE IF NOT EXISTS items (
 
         # 并发更新，使用 return_exceptions 避免单个失败影响全部
         enabled_feeds = [f for f in self.feeds.values() if f.config_site["enabled"]]
-        results = await asyncio.gather(
-            *[self.update_feed(feed, force) for feed in enabled_feeds],
-            return_exceptions=True,
-        )
+        async with aiohttp.ClientSession(
+            trust_env=True,
+            timeout=REQUEST_TIMEOUT,
+            headers={
+                "User-Agent": str(self.config.get("user_agent") or "AstrBot-RSS-Tool"),
+                "Accept": REQUEST_ACCEPT,
+            },
+        ) as session:
+            results = await asyncio.gather(
+                *[self.update_feed(feed, session, force) for feed in enabled_feeds],
+                return_exceptions=True,
+            )
         failed: list[RSSToolFeed] = []
         for feed_entry, result in zip(enabled_feeds, results):
             if isinstance(result, Exception):
@@ -361,16 +372,18 @@ CREATE TABLE IF NOT EXISTS items (
             return 0
 
         cutoff = int(time.time()) - days * 86400
-        feed_ids = {f.id for f in self.feeds.values() if f.config_site["enabled"]}
+        enabled_feed_ids = {
+            f.id for f in self.feeds.values() if f.config_site["enabled"]
+        }
 
         # 条件：发布时间 < cutoff 且 非（未读 且 feed 已启用）
-        if feed_ids:
-            enabled_placeholders = ",".join("?" for _ in feed_ids)
+        if enabled_feed_ids:
+            enabled_placeholders = ",".join("?" for _ in enabled_feed_ids)
             sql = (
                 "DELETE FROM items WHERE published < ? AND "
                 f"NOT (unread = 1 AND feed_id IN ({enabled_placeholders}))"
             )
-            params: list[int] = [cutoff, *feed_ids]
+            params: list[int] = [cutoff, *enabled_feed_ids]
         else:
             # 没有启用的 feed，所有过期条目均可清除
             sql = "DELETE FROM items WHERE published < ?"
@@ -381,6 +394,20 @@ CREATE TABLE IF NOT EXISTS items (
         if deleted > 0:
             await self.db.commit()
             logger.info("RSS 已清除 %d 条过期条目（超过 %d 天）", deleted, days)
+
+        # 清除无 items、不在 self.feeds 中的 feed
+        recorded_feed_ids = {f.id for f in self.feeds.values()}
+        sql = "DELETE FROM feeds WHERE id NOT IN (SELECT feed_id FROM items)"
+        if recorded_feed_ids:
+            sql += f" AND id NOT IN ({','.join('?' for _ in recorded_feed_ids)})"
+            params = list(recorded_feed_ids)
+        else:
+            params = []
+        async with self.db.execute(sql, params) as cursor:
+            if cursor.rowcount > 0:
+                await self.db.commit()
+                logger.info("RSS 已清除 %d 条无 items 的 Feed", deleted)
+
         return deleted
 
     # ── Feed 抓取与更新 ─────────────────────────────────────────
@@ -434,7 +461,12 @@ CREATE TABLE IF NOT EXISTS items (
         feed.fail_count = 0
         feed.next_retry = 0
 
-    async def update_feed(self, feed: RSSToolFeed, force: bool = False) -> int:
+    async def update_feed(
+        self,
+        feed: RSSToolFeed,
+        session: aiohttp.ClientSession,
+        force: bool = False,
+    ) -> int:
         """抓取并解析单个 Feed，将新条目写入数据库。
 
         Args:
@@ -448,69 +480,59 @@ CREATE TABLE IF NOT EXISTS items (
             return 0
 
         async with self._fetch_semaphore:
-            return await self._do_fetch(feed)
+            return await self._do_fetch(feed, session)
 
-    async def _do_fetch(self, feed: RSSToolFeed) -> int:
+    async def _do_fetch(self, feed: RSSToolFeed, session: aiohttp.ClientSession) -> int:
         """实际执行 Feed 抓取的内部方法。"""
         url = feed.config_site["url"]
 
         try:
-            async with aiohttp.ClientSession(
-                trust_env=True,
-                timeout=REQUEST_TIMEOUT,
-                headers={
-                    "User-Agent": str(
-                        self.config.get("user_agent") or "AstrBot-RSS-Tool"
-                    ),
-                    "Accept": REQUEST_ACCEPT,
-                },
-            ) as session:
-                cond_headers: dict[str, str] = {
-                    "If-Modified-Since": time.strftime(
-                        "%a, %d %b %Y %H:%M:%S GMT",
-                        time.gmtime(feed.last_fetch_time),
-                    ),
-                }
-                if feed.etag:
-                    cond_headers["If-None-Match"] = feed.etag
+            cond_headers: dict[str, str] = {
+                "If-Modified-Since": time.strftime(
+                    "%a, %d %b %Y %H:%M:%S GMT",
+                    time.gmtime(feed.last_fetch_time),
+                ),
+            }
+            if feed.etag:
+                cond_headers["If-None-Match"] = feed.etag
 
-                async with session.get(
-                    url,
-                    headers=cond_headers,
-                    allow_redirects=True,
-                    max_redirects=MAX_REDIRECTS,
-                ) as response:
-                    status = response.status
-                    resp_headers = response.headers
+            async with session.get(
+                url,
+                headers=cond_headers,
+                allow_redirects=True,
+                max_redirects=MAX_REDIRECTS,
+            ) as response:
+                status = response.status
+                resp_headers = response.headers
 
-                    # 304 Not Modified
-                    if status == 304:
-                        await self._reset_failure(feed)
-                        await self.mark_up_to_date(feed)
-                        return 0
+                # 304 Not Modified
+                if status == 304:
+                    await self._reset_failure(feed)
+                    await self.mark_up_to_date(feed)
+                    return 0
 
-                    # 301 永久重定向：更新存储的 URL
-                    redirected = self._redirected_url(url, response)
-                    if redirected != url:
-                        logger.info("RSS 301 永久重定向 [%s] -> [%s]", url, redirected)
-                        feed.config_site["url"] = redirected
-                        self.config_saver.save_config()
-                        await self.db.execute(
-                            "UPDATE feeds SET url = ? WHERE id = ?",
-                            (redirected, feed.id),
-                        )
-                        await self.db.commit()
-                        url = redirected
+                # 301 永久重定向：更新存储的 URL
+                redirected = self._redirected_url(url, response)
+                if redirected != url:
+                    logger.info("RSS 301 永久重定向 [%s] -> [%s]", url, redirected)
+                    feed.config_site["url"] = redirected
+                    self.config_saver.save_config()
+                    await self.db.execute(
+                        "UPDATE feeds SET url = ? WHERE id = ?",
+                        (redirected, feed.id),
+                    )
+                    await self.db.commit()
+                    url = redirected
 
-                    if status == 200:
-                        feed.etag = resp_headers.get("ETag", "")
-                        xml = await self._bounded_read(response)
-                    else:
-                        # 非 2xx/3xx/304：记录失败
-                        retry_after = resp_headers.get("Retry-After")
-                        logger.warning("RSS 抓取 HTTP 错误 [%s]: %s", url, status)
-                        await self._record_failure(feed, retry_after)
-                        return 0
+                if status == 200:
+                    feed.etag = resp_headers.get("ETag", "")
+                    xml = await self._bounded_read(response)
+                else:
+                    # 非 2xx/3xx/304：记录失败
+                    retry_after = resp_headers.get("Retry-After")
+                    logger.warning("RSS 抓取 HTTP 错误 [%s]: %s", url, status)
+                    await self._record_failure(feed, retry_after)
+                    return 0
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning("RSS 抓取网络异常 [%s]: %s", url, e)
             await self._record_failure(feed)
@@ -559,7 +581,7 @@ CREATE TABLE IF NOT EXISTS items (
             try:
                 published = datetime.fromisoformat(item.get("published"))
             except (ValueError, TypeError):
-                published = datetime.now()
+                published = datetime.now(timezone.utc)
 
             if published.timestamp() <= last_published:
                 continue
@@ -588,8 +610,7 @@ CREATE TABLE IF NOT EXISTS items (
                 """
 INSERT INTO items (feed_id, title, link, description, published, author, content, unread)
 VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-ON CONFLICT(link) DO UPDATE SET
-    feed_id = excluded.feed_id,
+ON CONFLICT(feed_id, link) DO UPDATE SET
     title = excluded.title,
     description = excluded.description,
     published = excluded.published,
@@ -616,7 +637,9 @@ ON CONFLICT(link) DO UPDATE SET
 
     # ── 查询 ────────────────────────────────────────────────────
 
-    async def query(self, fields: str, query_dict: dict, mark_as_read: bool) -> list[str]:
+    async def query(
+        self, fields: str, query_dict: dict, mark_as_read: bool
+    ) -> list[str]:
         """查询 Feed 条目并返回格式化文本。
 
         Args:
@@ -805,6 +828,8 @@ ON CONFLICT(link) DO UPDATE SET
             return False
         self.config["feeds"] = new_feeds
         await self.sync_feeds_meta()
+        # 不删除关联的 feeds 表和 items 表的项目，在用户删了重新添加时保留历史。
+        # purge_old_items 在经过 cleanup_days 之后自然会清除移除了的。
         return True
 
     def _find_site(self, url: str) -> RSSToolConfigSite | None:
@@ -922,8 +947,12 @@ ON CONFLICT(link) DO UPDATE SET
     async def _bounded_read(self, response: aiohttp.ClientResponse) -> bytes | None:
         max_length = self.config.get("max_rss_size_mb", 10) * 1024 * 1024
         content_length = response.headers.get("Content-Length")
-        if content_length is not None and int(content_length) > max_length:
-            return None
+        if content_length is not None:
+            try:
+                if int(content_length) > max_length:
+                    return None
+            except ValueError:
+                return None
         return await response.content.read(
             int(content_length) if content_length else max_length
         )

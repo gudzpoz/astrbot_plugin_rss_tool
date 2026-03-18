@@ -1,4 +1,4 @@
 aiosqlite>=0.21.0
 fastfeedparser>=0.5.9
-# fastfeedparser already depends lxml
 lxml
+lxml-html-clean>=0.4.0

@@ -6,9 +6,10 @@ HTML 清理、URL 清理、mark_read 等。
 
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 from rss import (
     RSSToolConfigSite,
@@ -373,6 +374,31 @@ class TestRepositoryQuery:
         result = await repo_with_feed.query("title", {"tag": "nonexistent"}, False)
         assert result == "--- nothing found ---"
 
+    async def test_query_by_since(self, repo_with_feed: RSSToolRepository):
+        feed = repo_with_feed.feeds["https://example.com/feed.xml"]
+        await self._insert_items(repo_with_feed, feed.id, 1)
+
+        before = datetime.fromtimestamp(int(time.time()) - 10, timezone.utc)
+        after = datetime.fromtimestamp(int(time.time()) + 10, timezone.utc)
+
+        result = await repo_with_feed.query(
+            "title", {"since": before.isoformat()}, False
+        )
+        assert "Title 0" in result
+        result = await repo_with_feed.query(
+            "title", {"since": after.isoformat()}, False
+        )
+        assert result == "--- nothing found ---"
+
+        result = await repo_with_feed.query(
+            "title", {"since": before.isoformat().split("+")[0] + "Z"}, False
+        )
+        assert "Title 0" in result
+        result = await repo_with_feed.query(
+            "title", {"since": after.isoformat().split("+")[0] + "Z"}, False
+        )
+        assert result == "--- nothing found ---"
+
 
 @pytest.mark.asyncio
 class TestRepositoryUpdateFeed:
@@ -446,15 +472,10 @@ class TestRepositoryUpdateFeed:
 
         with patch(
             "rss.aiohttp.ClientSession",
-            side_effect=Exception("connection refused"),
+            side_effect=aiohttp.ClientError("connection refused"),
         ):
-            # sync_feeds 使用 return_exceptions，但 update_feed 自身也应处理
-            try:
-                result = await repo_with_feed.update_feed(feed, force=True)
-                assert result == 0
-            except Exception:
-                # ClientSession 构造失败会抛异常，这在 sync_feeds 中被 gather 捕获
-                pass
+            result = await repo_with_feed.update_feed(feed, force=True)
+            assert result == 0
 
 
 @pytest.mark.asyncio

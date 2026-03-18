@@ -177,12 +177,11 @@ class RSSToolRepository:
 
     async def _set_config(self, key: str, value: str) -> None:
         """写入或更新数据库 config 表中的配置值。"""
-        async with self.db.execute(
+        await self.db.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
             (key, value),
-        ) as cursor:
-            await cursor.fetchone()
-            await self.db.commit()
+        )
+        await self.db.commit()
 
     async def _maybe_run_db_migration(self, version: int, *statements: str) -> None:
         """按版本号执行数据库迁移语句（仅在当前版本低于目标版本时执行）。"""
@@ -306,12 +305,12 @@ CREATE TABLE IF NOT EXISTS items (
                 "INSERT INTO feeds (url, last_fetched) VALUES (?, ?)",
                 (entry.config_site["url"], entry.last_fetch_time),
             ) as cursor:
-                await cursor.fetchone()
                 if not cursor.lastrowid:
                     raise RuntimeError(
                         f"Failed to insert feed: {entry.config_site['url']}"
                     )
                 entry.id = cursor.lastrowid
+        if newly_added:
             await self.db.commit()
 
     async def sync_feeds(self, force: bool = False) -> None:
@@ -320,11 +319,12 @@ CREATE TABLE IF NOT EXISTS items (
         await self.sync_feeds_meta()
 
         # 并发更新，使用 return_exceptions 避免单个失败影响全部
+        enabled_feeds = [f for f in self.feeds.values() if f.config_site["enabled"]]
         results = await asyncio.gather(
-            *[self.update_feed(feed, force) for feed in self.feeds.values()],
+            *[self.update_feed(feed, force) for feed in enabled_feeds],
             return_exceptions=True,
         )
-        for feed_entry, result in zip(self.feeds.values(), results):
+        for feed_entry, result in zip(enabled_feeds, results):
             if isinstance(result, Exception):
                 logger.warning(
                     "RSS 抓取失败 [%s]: %s", feed_entry.config_site["url"], result
@@ -350,15 +350,19 @@ CREATE TABLE IF NOT EXISTS items (
         feed_ids = {f.id for f in self.feeds.values() if f.config_site["enabled"]}
 
         # 条件：发布时间 < cutoff 且 非（未读 且 feed 已启用）
-        enabled_placeholders = ",".join("?" for _ in feed_ids)
-        sql = (
-            "DELETE FROM items WHERE published < ? AND "
-            f"NOT (unread = 1 AND feed_id IN ({enabled_placeholders}))"
-        )
-        params: list[int] = [cutoff, *feed_ids]
+        if feed_ids:
+            enabled_placeholders = ",".join("?" for _ in feed_ids)
+            sql = (
+                "DELETE FROM items WHERE published < ? AND "
+                f"NOT (unread = 1 AND feed_id IN ({enabled_placeholders}))"
+            )
+            params: list[int] = [cutoff, *feed_ids]
+        else:
+            # 没有启用的 feed，所有过期条目均可清除
+            sql = "DELETE FROM items WHERE published < ?"
+            params = [cutoff]
 
         async with self.db.execute(sql, params) as cursor:
-            await cursor.fetchall()
             deleted = cursor.rowcount
         if deleted > 0:
             await self.db.commit()
@@ -367,10 +371,9 @@ CREATE TABLE IF NOT EXISTS items (
 
     # ── Feed 抓取与更新 ─────────────────────────────────────────
 
-    async def mark_up_to_date(self, feed: RSSToolFeed) -> None:
-        """将 Feed 的最后抓取时间更新为当前时间，同时持久化 etag 与退避状态。"""
-        feed.last_fetch_time = int(time.time())
-        async with self.db.execute(
+    async def _persist_feed_state(self, feed: RSSToolFeed) -> None:
+        """持久化 feed 的当前状态到数据库（不修改 last_fetch_time）。"""
+        await self.db.execute(
             "UPDATE feeds SET last_fetched = ?, etag = ?, fail_count = ?, next_retry = ? WHERE id = ?",
             (
                 feed.last_fetch_time,
@@ -379,9 +382,13 @@ CREATE TABLE IF NOT EXISTS items (
                 feed.next_retry,
                 feed.id,
             ),
-        ) as cursor:
-            await cursor.fetchone()
+        )
         await self.db.commit()
+
+    async def mark_up_to_date(self, feed: RSSToolFeed) -> None:
+        """将 Feed 的最后抓取时间更新为当前时间，同时持久化 etag 与退避状态。"""
+        feed.last_fetch_time = int(time.time())
+        await self._persist_feed_state(feed)
 
     async def _record_failure(
         self, feed: RSSToolFeed, retry_after_header: str | None = None
@@ -406,7 +413,7 @@ CREATE TABLE IF NOT EXISTS items (
                     retry_after_seconds = 0
             backoff = max(backoff, retry_after_seconds)
         feed.next_retry = int(time.time() + backoff)
-        await self.mark_up_to_date(feed)
+        await self._persist_feed_state(feed)
 
     async def _reset_failure(self, feed: RSSToolFeed) -> None:
         """重置抓取失败计数与退避状态。"""
@@ -472,14 +479,14 @@ CREATE TABLE IF NOT EXISTS items (
                     if status == 301:
                         new_url = resp_headers.get("Location", "")
                         if new_url:
+                            new_url = urljoin(url, new_url)
                             logger.info("RSS 301 永久重定向 [%s] -> [%s]", url, new_url)
                             feed.config_site["url"] = new_url
                             self.config_saver.save_config()
-                            async with self.db.execute(
+                            await self.db.execute(
                                 "UPDATE feeds SET url = ? WHERE id = ?",
                                 (new_url, feed.id),
-                            ) as cur:
-                                await cur.fetchone()
+                            )
                             await self.db.commit()
                             url = new_url
 
@@ -565,7 +572,11 @@ CREATE TABLE IF NOT EXISTS items (
             link = _prune_url(link)
             author = item.get("author", "")
             description = _prune_html(item.get("description", ""))
-            content = typing.cast(list[dict[str, str]], item.get("content", []))
+            content = [
+                item
+                for item in typing.cast(list[dict[str, str]], item.get("content", []))
+                if item.get("type") and item.get("value")
+            ]
             text_content = (
                 ""
                 if not content
@@ -578,7 +589,7 @@ CREATE TABLE IF NOT EXISTS items (
             )
 
             # 使用 ON CONFLICT 避免覆盖已有条目的 unread 状态
-            async with self.db.execute(
+            await self.db.execute(
                 """
 INSERT INTO items (feed_id, title, link, description, published, author, content, unread)
 VALUES (?, ?, ?, ?, ?, ?, ?, 1)
@@ -599,8 +610,7 @@ ON CONFLICT(link) DO UPDATE SET
                     author,
                     text_content,
                 ),
-            ) as cursor:
-                await cursor.fetchone()
+            )
             added += 1
 
         if added > 0:
@@ -668,7 +678,10 @@ ON CONFLICT(link) DO UPDATE SET
         since = query.get("since")
         if since is not None:
             try:
-                since_dt = datetime.fromisoformat(since)
+                # Python 3.10 doesn't accept trailing 'Z'; normalize to +00:00
+                since_dt = datetime.fromisoformat(
+                    f"{since[:-1]}+00:00" if since.endswith("Z") else since
+                )
                 clauses.append("published >= ?")
                 params.append(int(since_dt.timestamp()))
             except (ValueError, TypeError):
@@ -903,7 +916,6 @@ ON CONFLICT(link) DO UPDATE SET
             f"UPDATE items SET unread = 0 WHERE feed_id IN ({placeholders}) AND unread = 1",
             list(feed_ids),
         ) as cursor:
-            await cursor.fetchall()
             count = cursor.rowcount
         await self.db.commit()
         return count

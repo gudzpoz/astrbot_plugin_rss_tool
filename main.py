@@ -10,6 +10,7 @@
 import re
 import urllib.parse
 
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.triggers.date import DateTrigger
 
 from astrbot.api import AstrBotConfig, logger
@@ -51,8 +52,12 @@ class RSSTool(Star):
 
     async def cron_refresh(self) -> None:
         """更新定时任务，定时同步 Feed。"""
-        await self.repo.sync_feeds()
-        self.add_cron_job()
+        try:
+            await self.repo.sync_feeds()
+        except Exception as e:
+            logger.exception("RSS Tool Feed 同步异常", exc_info=e)
+        finally:
+            self.add_cron_job()
 
     # ── 命令组：feed ─────────────────────────────────────────────
 
@@ -124,7 +129,8 @@ class RSSTool(Star):
             if not found:
                 return "feed invalid" if llm else f"无法识别链接内容: {url}"
         except Exception as e:
-            return f"connection error: {e}" if llm else f"连接错误: {e}"
+            logger.warning("订阅发现失败 [%s]: %s", url, e)
+            return "connection error" if llm else "连接错误，请检查链接是否可访问"
         url = found
 
         # 检查是否已存在相同 URL 的订阅
@@ -363,6 +369,10 @@ class RSSTool(Star):
         return "ok" if await self.repo.set_feed_enabled(url, enabled) else "not found"
 
     async def terminate(self) -> None:
-        """插件停用时关闭数据库连接。"""
+        """插件停用时移除定时任务并关闭数据库连接。"""
+        try:
+            self.cron.scheduler.remove_job("rss_tool_feed_sync")
+        except JobLookupError:
+            pass  # job 可能不存在
         await self.repo.close()
         logger.info("RSS Tool 插件已停止")

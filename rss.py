@@ -297,9 +297,7 @@ CREATE TABLE IF NOT EXISTS items (
             return 0
 
         cutoff = int(time.time()) - days * 86400
-        feed_ids = {
-            f.id for f in self.feeds.values() if f.config_site["enabled"]
-        }
+        feed_ids = {f.id for f in self.feeds.values() if f.config_site["enabled"]}
 
         # 条件：发布时间 < cutoff 且 非（未读 且 feed 已启用）
         enabled_placeholders = ",".join("?" for _ in feed_ids)
@@ -401,13 +399,13 @@ CREATE TABLE IF NOT EXISTS items (
 
         added = 0
         for item in typing.cast(list[FastFeedParserItem], parsed["entries"]):
-            title = item["title"]
-            link = item["link"]
+            title = item.get("title")
+            link = item.get("link")
             if not link or not title:
                 continue
 
             try:
-                published = datetime.fromisoformat(item["published"])
+                published = datetime.fromisoformat(item.get("published"))
             except (ValueError, TypeError):
                 published = datetime.now()
 
@@ -415,9 +413,9 @@ CREATE TABLE IF NOT EXISTS items (
                 continue
 
             link = _prune_url(link)
-            author = item["author"] or ""
-            description = _prune_html(item["description"] or "")
-            content = typing.cast(list[dict[str, str]], item["content"])
+            author = item.get("author", "")
+            description = _prune_html(item.get("description", ""))
+            content = typing.cast(list[dict[str, str]], item.get("content", []))
             text_content = (
                 ""
                 if not content

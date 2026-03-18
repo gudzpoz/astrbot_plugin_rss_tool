@@ -149,8 +149,9 @@ class RSSTool(Star):
         self, event: AstrMessageEvent, tag: str = "", limit: int = 10
     ):
         """预览 Atom/RSS Feed 订阅内容"""
+        query = {"tag": tag or None, "limit": limit}
         yield event.plain_result(
-            await self.repo.query("title,link", {"tag": tag, "limit": limit}, False),
+            await self.repo.query("title,link", query, False),
         )
 
     @feed.command("refresh")

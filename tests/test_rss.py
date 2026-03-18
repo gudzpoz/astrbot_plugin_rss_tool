@@ -4,6 +4,7 @@
 HTML 清理、URL 清理、mark_read 等。
 """
 
+import json
 import time
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -498,7 +499,9 @@ class TestPurgeOldItems:
         repo_with_feed.config["cleanup_days"] = 0
         feed = repo_with_feed.feeds["https://example.com/feed.xml"]
         old_ts = int(time.time()) - 90 * 86400
-        await self._insert_item(repo_with_feed, feed.id, "https://old/1", old_ts, unread=0)
+        await self._insert_item(
+            repo_with_feed, feed.id, "https://old/1", old_ts, unread=0
+        )
 
         deleted = await repo_with_feed.purge_old_items()
         assert deleted == 0
@@ -519,11 +522,17 @@ class TestPurgeOldItems:
         recent_ts = int(time.time()) - 1 * 86400
 
         # 旧已读 — 应被清除
-        await self._insert_item(repo_with_feed, feed.id, "https://old-read/1", old_ts, unread=0)
+        await self._insert_item(
+            repo_with_feed, feed.id, "https://old-read/1", old_ts, unread=0
+        )
         # 新已读 — 不应被清除
-        await self._insert_item(repo_with_feed, feed.id, "https://new-read/1", recent_ts, unread=0)
+        await self._insert_item(
+            repo_with_feed, feed.id, "https://new-read/1", recent_ts, unread=0
+        )
         # 旧未读（enabled feed）— 不应被清除
-        await self._insert_item(repo_with_feed, feed.id, "https://old-unread/1", old_ts, unread=1)
+        await self._insert_item(
+            repo_with_feed, feed.id, "https://old-unread/1", old_ts, unread=1
+        )
 
         deleted = await repo_with_feed.purge_old_items()
         assert deleted == 1
@@ -543,7 +552,9 @@ class TestPurgeOldItems:
         old_ts = int(time.time()) - 31 * 86400
 
         # 旧未读 + disabled feed — 应被清除
-        await self._insert_item(repo_with_feed, feed.id, "https://old-unread-disabled/1", old_ts, unread=1)
+        await self._insert_item(
+            repo_with_feed, feed.id, "https://old-unread-disabled/1", old_ts, unread=1
+        )
 
         deleted = await repo_with_feed.purge_old_items()
         assert deleted == 1
@@ -562,7 +573,9 @@ class TestPurgeOldItems:
         assert feed.config_site["enabled"] is True
         old_ts = int(time.time()) - 31 * 86400
 
-        await self._insert_item(repo_with_feed, feed.id, "https://old-unread-enabled/1", old_ts, unread=1)
+        await self._insert_item(
+            repo_with_feed, feed.id, "https://old-unread-enabled/1", old_ts, unread=1
+        )
 
         deleted = await repo_with_feed.purge_old_items()
         assert deleted == 0
@@ -574,8 +587,6 @@ class TestPurgeOldItems:
 
     async def test_purge_mixed_scenario(self, tmp_path):
         """混合场景：多个 Feed，不同 enabled 状态，不同已读状态。"""
-        import json
-        from pathlib import Path
 
         conf_path = tmp_path / "cfg.json"
         feeds_cfg = [
@@ -596,10 +607,16 @@ class TestPurgeOldItems:
                 "frequency_hours": 6,
             },
         ]
-        default = {"allow_agents": True, "user_agent": "Test", "cleanup_days": 7, "feeds": feeds_cfg}
+        default = {
+            "allow_agents": True,
+            "user_agent": "Test",
+            "cleanup_days": 7,
+            "feeds": feeds_cfg,
+        }
         conf_path.write_text(json.dumps(default), encoding="utf-8")
 
         from astrbot.api import AstrBotConfig
+
         config = AstrBotConfig(config_path=str(conf_path), default_config=default)
         repo = RSSToolRepository(tmp_path / "test.db", config)
         await repo.initialize()
@@ -610,24 +627,34 @@ class TestPurgeOldItems:
         recent_ts = int(time.time()) - 1 * 86400
 
         # enabled feed: 旧已读 → 清除
-        await self._insert_item(repo, enabled_feed.id, "https://e/old-read", old_ts, unread=0)
+        await self._insert_item(
+            repo, enabled_feed.id, "https://e/old-read", old_ts, unread=0
+        )
         # enabled feed: 旧未读 → 保留
-        await self._insert_item(repo, enabled_feed.id, "https://e/old-unread", old_ts, unread=1)
+        await self._insert_item(
+            repo, enabled_feed.id, "https://e/old-unread", old_ts, unread=1
+        )
         # enabled feed: 新已读 → 保留
-        await self._insert_item(repo, enabled_feed.id, "https://e/new-read", recent_ts, unread=0)
+        await self._insert_item(
+            repo, enabled_feed.id, "https://e/new-read", recent_ts, unread=0
+        )
         # disabled feed: 旧未读 → 清除
-        await self._insert_item(repo, disabled_feed.id, "https://d/old-unread", old_ts, unread=1)
+        await self._insert_item(
+            repo, disabled_feed.id, "https://d/old-unread", old_ts, unread=1
+        )
         # disabled feed: 旧已读 → 清除
-        await self._insert_item(repo, disabled_feed.id, "https://d/old-read", old_ts, unread=0)
+        await self._insert_item(
+            repo, disabled_feed.id, "https://d/old-read", old_ts, unread=0
+        )
         # disabled feed: 新未读 → 保留
-        await self._insert_item(repo, disabled_feed.id, "https://d/new-unread", recent_ts, unread=1)
+        await self._insert_item(
+            repo, disabled_feed.id, "https://d/new-unread", recent_ts, unread=1
+        )
 
         deleted = await repo.purge_old_items()
         assert deleted == 3  # e/old-read + d/old-unread + d/old-read
 
-        async with repo.db.execute(
-            "SELECT link FROM items ORDER BY link"
-        ) as cur:
+        async with repo.db.execute("SELECT link FROM items ORDER BY link") as cur:
             remaining = [row[0] for row in await cur.fetchall()]
         assert remaining == [
             "https://d/new-unread",
@@ -637,14 +664,18 @@ class TestPurgeOldItems:
 
         await repo.close()
 
-    async def test_purge_default_config_missing_key(self, repo_with_feed: RSSToolRepository):
+    async def test_purge_default_config_missing_key(
+        self, repo_with_feed: RSSToolRepository
+    ):
         """配置中无 cleanup_days 时应使用默认值 30 天。"""
         # 确保 config 中没有 cleanup_days 键
         repo_with_feed.config.pop("cleanup_days", None)
         feed = repo_with_feed.feeds["https://example.com/feed.xml"]
         old_ts = int(time.time()) - 91 * 86400
 
-        await self._insert_item(repo_with_feed, feed.id, "https://default/1", old_ts, unread=0)
+        await self._insert_item(
+            repo_with_feed, feed.id, "https://default/1", old_ts, unread=0
+        )
 
         # 默认 30 天，31 天前的已读条目应被清除
         deleted = await repo_with_feed.purge_old_items()

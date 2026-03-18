@@ -17,7 +17,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
-from .rss import RSSToolRepository
+from .rss import RSSToolFeed, RSSToolRepository
 
 
 class RSSTool(Star):
@@ -165,7 +165,9 @@ class RSSTool(Star):
         """预览 Atom/RSS Feed 订阅内容"""
         query = {"tag": tag or None, "limit": limit}
         yield event.plain_result(
-            await self.repo.query("title,link", query, False),
+            "\n".join(
+                await self.repo.query("title,link", query, False),
+            )
         )
 
     @feed.command("refresh")
@@ -260,8 +262,10 @@ class RSSTool(Star):
     async def rss_tool_list(self, _: AstrMessageEvent):
         """List Atom/RSS Feed subscriptions."""
         # 确保 LLM 获取的数据是最新的
-        await self.repo.sync_feeds()
-        lines: list[str] = []
+        failed = await self.repo.sync_feeds()
+        # 我们选择让 LLM 及用户 prompt 决定是否展示失败的订阅
+        lines = self.report_error_to_llm(failed)
+        lines.append("--- results ---")
         for site in self.repo.sites:
             lines.append("------")
             lines.append(f"- title: {site['title']}")
@@ -288,8 +292,12 @@ class RSSTool(Star):
                 }
         """
         # 确保 LLM 获取的数据是最新的
-        await self.repo.sync_feeds()
-        return await self.repo.query(columns, query, True)
+        failed = await self.repo.sync_feeds()
+        # 我们选择让 LLM 及用户 prompt 决定是否展示失败的订阅
+        lines = self.report_error_to_llm(failed)
+        lines.append("--- results ---")
+        lines.extend(await self.repo.query(columns, query, True))
+        return "\n".join(lines)
 
     @filter.llm_tool(name="rss_tool_update_tags")
     async def rss_tool_update_tags(
@@ -367,6 +375,19 @@ class RSSTool(Star):
         if not self.repo.allow_agents:
             return "agent modification is disabled by config"
         return "ok" if await self.repo.set_feed_enabled(url, enabled) else "not found"
+
+    @staticmethod
+    def report_error_to_llm(failed: list[RSSToolFeed]) -> list[str]:
+        """将订阅同步失败的 Feed 通知给 LLM。"""
+        lines: list[str] = []
+        if failed:
+            lines.append("------")
+            lines.append("the following feeds failed to sync:")
+            for feed in failed:
+                lines.append(
+                    f"- “{feed.config_site['title']}”: {feed.config_site['url']}"
+                )
+        return lines
 
     async def terminate(self) -> None:
         """插件停用时移除定时任务并关闭数据库连接。"""

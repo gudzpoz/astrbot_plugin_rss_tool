@@ -313,8 +313,12 @@ CREATE TABLE IF NOT EXISTS items (
         if newly_added:
             await self.db.commit()
 
-    async def sync_feeds(self, force: bool = False) -> None:
-        """触发需要更新的 Feed 抓取。"""
+    async def sync_feeds(self, force: bool = False) -> list[RSSToolFeed]:
+        """触发需要更新的 Feed 抓取。
+
+        Returns:
+            更新失败的 Feed 列表。
+        """
 
         await self.sync_feeds_meta()
 
@@ -324,13 +328,19 @@ CREATE TABLE IF NOT EXISTS items (
             *[self.update_feed(feed, force) for feed in enabled_feeds],
             return_exceptions=True,
         )
+        failed: list[RSSToolFeed] = []
         for feed_entry, result in zip(enabled_feeds, results):
             if isinstance(result, Exception):
                 logger.warning(
                     "RSS 抓取失败 [%s]: %s", feed_entry.config_site["url"], result
                 )
+                failed.append(feed_entry)
+            elif feed_entry.fail_count > 0:
+                failed.append(feed_entry)
 
         await self.purge_old_items()
+
+        return failed
 
     async def purge_old_items(self) -> int:
         """清除过期的旧条目。
@@ -621,7 +631,7 @@ ON CONFLICT(link) DO UPDATE SET
 
     # ── 查询 ────────────────────────────────────────────────────
 
-    async def query(self, fields: str, query: object, mark_as_read: bool) -> str:
+    async def query(self, fields: str, query: object, mark_as_read: bool) -> list[str]:
         """查询 Feed 条目并返回格式化文本。
 
         Args:
@@ -641,7 +651,7 @@ ON CONFLICT(link) DO UPDATE SET
             if f in ALLOWED_QUERY_COLUMNS
         ]
         if not field_names:
-            return "--- nothing found ---"
+            return ["--- nothing found ---"]
 
         # 构建参数化查询
         params: list[int | str] = []
@@ -665,7 +675,7 @@ ON CONFLICT(link) DO UPDATE SET
             )
 
         if not feed_ids:
-            return "--- nothing found ---"
+            return ["--- nothing found ---"]
 
         # feed_id IN (?, ?, ...) — 参数化
         placeholders = ",".join("?" for _ in feed_ids)
@@ -724,7 +734,7 @@ ON CONFLICT(link) DO UPDATE SET
             )
             await self.db.commit()
 
-        return "--- nothing found ---" if not formatted else "\n".join(formatted)
+        return formatted or ["--- nothing found ---"]
 
     # ── 订阅管理 ────────────────────────────────────────────────
 

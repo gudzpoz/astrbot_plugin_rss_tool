@@ -318,7 +318,7 @@ class TestRepositoryQuery:
     async def test_query_empty(self, repo_with_feed: RSSToolRepository):
         """无条目时应返回 nothing found。"""
         result = await repo_with_feed.query("title,link", {}, False)
-        assert result == "--- nothing found ---"
+        assert result == ["--- nothing found ---"]
 
     async def test_query_with_items(self, repo_with_feed: RSSToolRepository):
         feed = repo_with_feed.feeds["https://example.com/feed.xml"]
@@ -327,8 +327,8 @@ class TestRepositoryQuery:
         result = await repo_with_feed.query(
             "title,link", {"unread_only": True, "limit": 10}, False
         )
-        assert "Title 0" in result
-        assert "Title 2" in result
+        assert "Title 0" in "\n".join(result)
+        assert "Title 2" in "\n".join(result)
 
     async def test_query_marks_as_read(self, repo_with_feed: RSSToolRepository):
         feed = repo_with_feed.feeds["https://example.com/feed.xml"]
@@ -340,12 +340,12 @@ class TestRepositoryQuery:
         result = await repo_with_feed.query(
             "title", {"unread_only": True, "limit": 10}, False
         )
-        assert result == "--- nothing found ---"
+        assert result == ["--- nothing found ---"]
 
     async def test_query_invalid_columns(self, repo_with_feed: RSSToolRepository):
         """非法列名应被过滤，全部非法时返回 nothing found。"""
         result = await repo_with_feed.query("invalid_col,drop_table", {}, False)
-        assert result == "--- nothing found ---"
+        assert result == ["--- nothing found ---"]
 
     async def test_query_limit_clamped(self, repo_with_feed: RSSToolRepository):
         """limit 应被限制在 [1, 100] 范围内。"""
@@ -365,14 +365,14 @@ class TestRepositoryQuery:
         result = await repo_with_feed.query(
             "title", {"tag": "tech", "unread_only": True}, False
         )
-        assert "Title 0" in result
+        assert "Title 0" in "\n".join(result)
 
     async def test_query_by_nonexistent_tag(self, repo_with_feed: RSSToolRepository):
         feed = repo_with_feed.feeds["https://example.com/feed.xml"]
         await self._insert_items(repo_with_feed, feed.id, 1)
 
         result = await repo_with_feed.query("title", {"tag": "nonexistent"}, False)
-        assert result == "--- nothing found ---"
+        assert result == ["--- nothing found ---"]
 
     async def test_query_by_since(self, repo_with_feed: RSSToolRepository):
         feed = repo_with_feed.feeds["https://example.com/feed.xml"]
@@ -384,20 +384,20 @@ class TestRepositoryQuery:
         result = await repo_with_feed.query(
             "title", {"since": before.isoformat()}, False
         )
-        assert "Title 0" in result
+        assert "Title 0" in "\n".join(result)
         result = await repo_with_feed.query(
             "title", {"since": after.isoformat()}, False
         )
-        assert result == "--- nothing found ---"
+        assert result == ["--- nothing found ---"]
 
         result = await repo_with_feed.query(
             "title", {"since": before.isoformat().split("+")[0] + "Z"}, False
         )
-        assert "Title 0" in result
+        assert "Title 0" in "\n".join(result)
         result = await repo_with_feed.query(
             "title", {"since": after.isoformat().split("+")[0] + "Z"}, False
         )
-        assert result == "--- nothing found ---"
+        assert result == ["--- nothing found ---"]
 
 
 @pytest.mark.asyncio

@@ -79,6 +79,24 @@ class RSSTool(Star):
         """添加 Atom/RSS Feed 订阅"""
         yield event.plain_result(await self.add_feed_common(url, comma_sep_tags, False))
 
+    @staticmethod
+    def _parse_tags(comma_sep_tags: str) -> list[str]:
+        """解析逗号/分号分隔的标签字符串为列表。
+
+        支持中英文逗号、分号、顿号等多种分隔符。
+
+        Args:
+            comma_sep_tags: 逗号/分号分隔的标签字符串。
+
+        Returns:
+            去除空白后的标签列表。
+        """
+        return [
+            tag
+            for tag in (tag.strip() for tag in re.split(r"[,;，；、]+", comma_sep_tags))
+            if tag != ""
+        ]
+
     async def add_feed_common(self, url: str, comma_sep_tags: str, llm: bool) -> str:
         """添加 Feed 的通用逻辑，供命令和 LLM tool 共用。
 
@@ -99,12 +117,7 @@ class RSSTool(Star):
                 else f"无效的链接: {url}\n链接形式通常为 https://XXX.com/YYY.rss"
             )
 
-        # 解析标签列表，支持多种分隔符
-        tags = [
-            tag
-            for tag in (tag.strip() for tag in re.split(r"[,;，；、]+", comma_sep_tags))
-            if tag != ""
-        ]
+        tags = self._parse_tags(comma_sep_tags)
 
         # 检查是否已存在相同 URL 的订阅
         same_url_sites = [site for site in self.repo.sites if site["url"] == url]
@@ -118,7 +131,7 @@ class RSSTool(Star):
                 return "already exists" if llm else "已存在相同的订阅"
 
         await self.repo.add_feed(url, tags)
-        logger.info(f"RSS 订阅已添加: {url}")
+        logger.info("RSS 订阅已添加: %s", url)
         return "ok" if llm else "添加成功"
 
     @feed.command("delete")
@@ -126,7 +139,7 @@ class RSSTool(Star):
         """删除 Atom/RSS Feed 订阅"""
         deleted = await self.repo.delete_feed(url)
         if deleted:
-            logger.info(f"RSS 订阅已删除: {url}")
+            logger.info("RSS 订阅已删除: %s", url)
             yield event.plain_result("删除成功")
         else:
             yield event.plain_result("未找到该订阅")
@@ -146,7 +159,63 @@ class RSSTool(Star):
         await self.repo.sync_feeds(force)
         yield event.plain_result("刷新成功")
 
-    # ── LLM Tool ─────────────────────────────────────────────────
+    @feed.command("tag")
+    async def feed_tag(
+        self, event: AstrMessageEvent, url: str, action: str, comma_sep_tags: str = ""
+    ):
+        """修改 Feed 标签。action: set/add/remove"""
+        tags = self._parse_tags(comma_sep_tags)
+        if action == "set":
+            result = await self.repo.update_feed_tags(url, set_tags=tags)
+        elif action == "add":
+            result = await self.repo.update_feed_tags(url, add_tags=tags)
+        elif action == "remove":
+            result = await self.repo.update_feed_tags(url, remove_tags=tags)
+        else:
+            yield event.plain_result("无效的操作，请使用 set/add/remove")
+            return
+        yield event.plain_result("修改成功" if result else "未找到该订阅")
+
+    @feed.command("enable")
+    async def feed_enable(self, event: AstrMessageEvent, url: str):
+        """启用指定 Feed"""
+        yield event.plain_result(
+            "启用成功"
+            if await self.repo.set_feed_enabled(url, True)
+            else "未找到该订阅"
+        )
+
+    @feed.command("disable")
+    async def feed_disable(self, event: AstrMessageEvent, url: str):
+        """禁用指定 Feed"""
+        yield event.plain_result(
+            "禁用成功"
+            if await self.repo.set_feed_enabled(url, False)
+            else "未找到该订阅"
+        )
+
+    @feed.command("frequency")
+    async def feed_frequency(self, event: AstrMessageEvent, url: str, hours: int):
+        """修改 Feed 更新频率（小时）"""
+        yield event.plain_result(
+            "修改成功"
+            if await self.repo.set_feed_frequency(url, hours)
+            else "未找到该订阅"
+        )
+
+    @feed.command("read")
+    async def feed_read(self, event: AstrMessageEvent, url: str = "", tag: str = ""):
+        """标记 Feed 条目为已读。可按 url 或 tag 过滤，均为空则标记全部"""
+        count = await self.repo.mark_read(
+            feed_url=url or None,
+            tag=tag or None,
+        )
+        if count < 0:
+            yield event.plain_result("未找到")
+        else:
+            yield event.plain_result("已标为已读")
+
+    # ── LLM Tool ─────────────────────────────────────────────
 
     @filter.llm_tool(name="rss_tool_add")
     async def rss_tool_add(self, _: AstrMessageEvent, url: str, tags: str = ""):
@@ -176,6 +245,7 @@ class RSSTool(Star):
     @filter.llm_tool(name="rss_tool_list")
     async def rss_tool_list(self, _: AstrMessageEvent):
         """List Atom/RSS Feed subscriptions."""
+        # 确保 LLM 获取的数据是最新的
         await self.repo.sync_feeds()
         lines: list[str] = []
         for site in self.repo.sites:
@@ -183,6 +253,8 @@ class RSSTool(Star):
             lines.append(f"- title: {site['title']}")
             lines.append(f"- url: {site['url']}")
             lines.append(f"- tags: {','.join(site['tags'])}")
+            lines.append(f"- enabled: {site['enabled']}")
+            lines.append(f"- frequency_hours: {site['frequency_hours']}")
         return "\n".join(lines) if lines else "no subscriptions"
 
     @filter.llm_tool(name="rss_tool_query")
@@ -201,8 +273,86 @@ class RSSTool(Star):
                     "limit": 10
                 }
         """
+        # 确保 LLM 获取的数据是最新的
         await self.repo.sync_feeds()
         return await self.repo.query(columns, query, True)
+
+    @filter.llm_tool(name="rss_tool_update_tags")
+    async def rss_tool_update_tags(
+        self,
+        _: AstrMessageEvent,
+        url: str,
+        set_tags: str = "",
+        add_tags: str = "",
+        remove_tags: str = "",
+    ):
+        """Update tags of an Atom/RSS Feed subscription.
+
+        Args:
+            url(string): Feed url.
+            set_tags(string): Comma separated tags to replace all existing tags. Takes priority over add/remove.
+            add_tags(string): Comma separated tags to add.
+            remove_tags(string): Comma separated tags to remove.
+        """
+        if not self.repo.allow_agents:
+            return "agent modification is disabled by config"
+        set_list = (
+            [t.strip() for t in set_tags.split(",") if t.strip()] if set_tags else None
+        )
+        add_list = (
+            [t.strip() for t in add_tags.split(",") if t.strip()] if add_tags else None
+        )
+        rm_list = (
+            [t.strip() for t in remove_tags.split(",") if t.strip()]
+            if remove_tags
+            else None
+        )
+        return (
+            "ok"
+            if await self.repo.update_feed_tags(
+                url,
+                set_tags=set_list,
+                add_tags=add_list,
+                remove_tags=rm_list,
+            )
+            else "not found"
+        )
+
+    @filter.llm_tool(name="rss_tool_mark_read")
+    async def rss_tool_mark_read(
+        self,
+        _: AstrMessageEvent,
+        feed: str = "",
+        tag: str = "",
+    ):
+        """Mark RSS feed entries as read.
+
+        Args:
+            feed(string): Feed url to filter. Empty for all.
+            tag(string): Tag to filter. Empty for all.
+        """
+        count = await self.repo.mark_read(
+            feed_url=feed or None,
+            tag=tag or None,
+        )
+        return "ok" if count >= 0 else "not found"
+
+    @filter.llm_tool(name="rss_tool_set_enabled")
+    async def rss_tool_set_enabled(
+        self,
+        _: AstrMessageEvent,
+        url: str,
+        enabled: bool,
+    ):
+        """Enable or disable an Atom/RSS Feed subscription.
+
+        Args:
+            url(string): Feed url.
+            enabled(boolean): True to enable, False to disable.
+        """
+        if not self.repo.allow_agents:
+            return "agent modification is disabled by config"
+        return "ok" if await self.repo.set_feed_enabled(url, enabled) else "not found"
 
     async def terminate(self) -> None:
         """插件停用时关闭数据库连接。"""

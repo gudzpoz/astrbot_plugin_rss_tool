@@ -26,8 +26,7 @@ try:
 except ImportError:
     import lxml.html.clean as _html_clean
 
-from astrbot.api import logger
-from astrbot.core.config.astrbot_config import AstrBotConfig
+from astrbot.api import AstrBotConfig, logger
 
 # HTTP Accept 头，优先接受 Atom/RSS 格式
 REQUEST_ACCEPT = (
@@ -257,7 +256,10 @@ CREATE TABLE IF NOT EXISTS items (
                 (entry.config_site["url"], entry.last_fetch_time),
             ) as cursor:
                 await cursor.fetchone()
-                assert cursor.lastrowid
+                if not cursor.lastrowid:
+                    raise RuntimeError(
+                        f"Failed to insert feed: {entry.config_site['url']}"
+                    )
                 entry.id = cursor.lastrowid
             await self.db.commit()
 
@@ -274,7 +276,7 @@ CREATE TABLE IF NOT EXISTS items (
         for feed_entry, result in zip(self.feeds.values(), results):
             if isinstance(result, Exception):
                 logger.warning(
-                    f"RSS 抓取失败 [{feed_entry.config_site['url']}]: {result}"
+                    "RSS 抓取失败 [%s]: %s", feed_entry.config_site["url"], result
                 )
 
     # ── Feed 抓取与更新 ─────────────────────────────────────────
@@ -326,11 +328,13 @@ CREATE TABLE IF NOT EXISTS items (
                         await self.mark_up_to_date(feed)
                         return 0
                     if response.status != 200:
-                        logger.warning(f"RSS 抓取 HTTP 错误 [{url}]: {response.status}")
+                        logger.warning(
+                            "RSS 抓取 HTTP 错误 [%s]: %s", url, response.status
+                        )
                         return 0
                     xml = await response.content.read()
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning(f"RSS 抓取网络异常 [{url}]: {e}")
+            logger.warning("RSS 抓取网络异常 [%s]: %s", url, e)
             return 0
 
         try:
@@ -338,7 +342,7 @@ CREATE TABLE IF NOT EXISTS items (
                 xml, include_media=False, include_enclosures=False
             )
         except Exception as e:
-            logger.warning(f"RSS 解析失败 [{url}]: {e}")
+            logger.warning("RSS 解析失败 [%s]: %s", url, e)
             return 0
 
         # 自动填充 Feed 标题
@@ -411,8 +415,10 @@ ON CONFLICT(link) DO UPDATE SET
                 ),
             ) as cursor:
                 await cursor.fetchone()
-            await self.db.commit()
             added += 1
+
+        if added > 0:
+            await self.db.commit()
 
         await self.mark_up_to_date(feed)
         return added
@@ -480,7 +486,7 @@ ON CONFLICT(link) DO UPDATE SET
                 clauses.append("published >= ?")
                 params.append(int(since_dt.timestamp()))
             except (ValueError, TypeError):
-                logger.warning(f"RSS 查询 since 参数格式错误: {since}")
+                logger.warning("RSS 查询 since 参数格式错误: %s", since)
 
         # 安全拼接列名（已经过白名单过滤）+ 参数化 WHERE/LIMIT
         columns_sql = ",".join(field_names)
@@ -515,7 +521,7 @@ ON CONFLICT(link) DO UPDATE SET
         if mark_as_read and ids:
             await self.db.executemany(
                 "UPDATE items SET unread = 0 WHERE id = ?",
-                ((id,) for id in ids),
+                ((item_id,) for item_id in ids),
             )
             await self.db.commit()
 
@@ -550,22 +556,118 @@ ON CONFLICT(link) DO UPDATE SET
         await self.sync_feeds_meta()
         return True
 
-    async def refresh(self, force: bool = False) -> None:
-        """刷新所有 Feed 订阅。
+    def _find_site(self, url: str) -> RSSToolConfigSite | None:
+        """根据 URL 查找对应的配置项。"""
+        for site in self.config["feeds"]:
+            if site["url"] == url:
+                return site
+        return None
+
+    async def update_feed_tags(
+        self,
+        url: str,
+        *,
+        set_tags: list[str] | None = None,
+        add_tags: list[str] | None = None,
+        remove_tags: list[str] | None = None,
+    ) -> bool:
+        """修改指定 Feed 的标签。
+
+        支持三种操作（按优先级）：set 覆盖、add 追加、remove 移除。
+        同一次调用中 set 优先级最高，若提供 set_tags 则忽略 add/remove。
+
+        Returns:
+            True 表示成功修改，False 表示未找到对应订阅。
+        """
+        site = self._find_site(url)
+        if site is None:
+            return False
+
+        if set_tags is not None:
+            site["tags"] = [t.strip() for t in set_tags if t.strip()]
+        else:
+            current = set(site["tags"])
+            if add_tags:
+                current.update(t.strip() for t in add_tags if t.strip())
+            if remove_tags:
+                current -= {t.strip() for t in remove_tags}
+            site["tags"] = sorted(current)
+
+        await self.sync_feeds_meta()
+        return True
+
+    async def set_feed_enabled(self, url: str, enabled: bool) -> bool:
+        """启用或禁用指定 Feed。
+
+        Returns:
+            True 表示成功修改，False 表示未找到对应订阅。
+        """
+        site = self._find_site(url)
+        if site is None:
+            return False
+        site["enabled"] = enabled
+        await self.sync_feeds_meta()
+        return True
+
+    async def set_feed_frequency(self, url: str, hours: int) -> bool:
+        """修改指定 Feed 的更新频率。
 
         Args:
-            force: 为 True 时忽略更新频率限制强制刷新所有 Feed。
+            url: Feed 链接。
+            hours: 更新间隔（小时），最小 1 小时。
+
+        Returns:
+            True 表示成功修改，False 表示未找到对应订阅。
         """
-        await self.sync_feeds()
-        results = await asyncio.gather(
-            *(self.update_feed(feed, force) for feed in self.feeds.values()),
-            return_exceptions=True,
-        )
-        for feed_entry, result in zip(self.feeds.values(), results):
-            if isinstance(result, Exception):
-                logger.warning(
-                    f"RSS 刷新失败 [{feed_entry.config_site['url']}]: {result}"
-                )
+        site = self._find_site(url)
+        if site is None:
+            return False
+        hours = max(1, hours)
+        site["frequency_hours"] = hours
+        await self.sync_feeds_meta()
+        return True
+
+    async def mark_read(
+        self,
+        *,
+        feed_url: str | None = None,
+        tag: str | None = None,
+    ) -> int:
+        """将指定范围的条目标记为已读。
+
+        Args:
+            feed_url: 按 Feed URL 过滤。
+            tag: 按标签过滤。
+            若两者均为 None，则标记所有条目为已读。
+
+        Returns:
+            受影响的条目数，-1 表示未找到对应条目。
+        """
+        feed_ids: set[int] = set()
+
+        if feed_url is not None:
+            feed_obj = self.feeds.get(feed_url)
+            if feed_obj is not None:
+                feed_ids.add(feed_obj.id)
+        elif tag is not None:
+            tag_list = self.tags.get(tag.lower())
+            if tag_list is not None:
+                feed_ids.update(f.id for f in tag_list)
+        else:
+            feed_ids.update(f.id for f in self.feeds.values())
+
+        if not feed_ids:
+            return -1
+
+        placeholders = ",".join("?" for _ in feed_ids)
+        async with self.db.execute(
+            f"UPDATE items SET unread = 0 WHERE feed_id IN ({placeholders}) AND unread = 1",
+            list(feed_ids),
+        ) as cursor:
+            await cursor.fetchall()
+            count = cursor.rowcount
+        await self.db.commit()
+        return count
 
 
 def _prune_html(text: str) -> str:
@@ -588,13 +690,15 @@ def _prune_url(url: str) -> str:
     """清理 URL，去除 utm_ 参数，返回纯文本内容。"""
     try:
         parsed = urlparse(url)
-        query = {k: v for k, v in parse_qs(parsed.query) if not k.startswith("utm_")}
+        query = {
+            k: v for k, v in parse_qs(parsed.query).items() if not k.startswith("utm_")
+        }
         pruned = ParseResult(
             parsed.scheme,
             parsed.netloc,
             parsed.path,
             parsed.params,
-            urlencode(query),
+            urlencode(query, doseq=True),
             parsed.fragment,
         )
         return urlunparse(pruned)
